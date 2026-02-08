@@ -1,4 +1,4 @@
-//! shinydb - Yet Another Database
+//! ShinyDb
 //! Root module that exports all public APIs and imports all testable modules.
 const std = @import("std");
 const Io = std.Io;
