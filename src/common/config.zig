@@ -43,6 +43,7 @@ pub const Config = struct {
         vlog: []const u8,
         wal: []const u8,
         index: []const u8,
+        metadata: []const u8,
     },
     index: struct {
         primary: struct {

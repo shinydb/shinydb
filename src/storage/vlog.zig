@@ -20,6 +20,8 @@ const Header = struct {
     count: u64,
     deleted: u64,
     last_gc_ts: i64,
+    system_store_key_exists: bool = false,
+    system_store_key: u128 = 0,
 };
 
 pub const VLogConfig = struct {
@@ -88,12 +90,15 @@ pub const ValueLog = struct {
         _ = allocator;
         if (is_new) {
             // Write header to beginning of file
-            var header_buf: [29]u8 = undefined; // 4 + 1 + 8 + 8 + 8 = 29 bytes
+            // Format: magic(4) + version(1) + count(8) + deleted(8) + last_gc_ts(8) + system_store_key_exists(1) + system_store_key(16) = 46 bytes
+            var header_buf: [46]u8 = undefined;
             mem.writeInt(u32, header_buf[0..4], MAGIC, .little);
             header_buf[4] = VERSION;
             mem.writeInt(u64, header_buf[5..13], 0, .little); // count
             mem.writeInt(u64, header_buf[13..21], 0, .little); // deleted
             mem.writeInt(i64, header_buf[21..29], 0, .little); // last_gc_ts
+            header_buf[29] = 0; // system_store_key_exists = false
+            mem.writeInt(u128, header_buf[30..46], 0, .little); // system_store_key = 0
             try file.writePositionalAll(io, &header_buf, 0);
             try file.sync(io);
             return Header{
@@ -102,9 +107,11 @@ pub const ValueLog = struct {
                 .count = 0,
                 .deleted = 0,
                 .last_gc_ts = 0,
+                .system_store_key_exists = false,
+                .system_store_key = 0,
             };
         } else {
-            var header_buf: [29]u8 = undefined;
+            var header_buf: [46]u8 = undefined;
             _ = try file.readPositionalAll(io, &header_buf, 0);
             const magic = mem.readInt(u32, header_buf[0..4], .little);
             if (magic != MAGIC) return error.InvalidMagicNumber;
@@ -113,12 +120,16 @@ pub const ValueLog = struct {
             const count = mem.readInt(u64, header_buf[5..13], .little);
             const deleted = mem.readInt(u64, header_buf[13..21], .little);
             const ts = mem.readInt(i64, header_buf[21..29], .little);
+            const system_store_key_exists = header_buf[29] != 0;
+            const system_store_key = mem.readInt(u128, header_buf[30..46], .little);
             return Header{
                 .magic = magic,
                 .version = version,
                 .count = count,
                 .deleted = deleted,
                 .last_gc_ts = ts,
+                .system_store_key_exists = system_store_key_exists,
+                .system_store_key = system_store_key,
             };
         }
     }
@@ -178,7 +189,7 @@ pub const ValueLog = struct {
         // Format: key(16) + value_len(8) + value(N) + timestamp(8) + checksum(8)
 
         // First, read key and value_len to determine total size
-        var header_buf: [16 + 8]u8 = undefined;  // key + value_len
+        var header_buf: [16 + 8]u8 = undefined; // key + value_len
         _ = try source_file.readPositionalAll(self.io, &header_buf, offset);
 
         // Extract value_len to calculate total entry size (we'll re-parse the key later)
@@ -220,9 +231,9 @@ test "vlog - Header struct defaults" {
 }
 
 test "vlog - Header binary format size" {
-    // Header format: magic(4) + version(1) + count(8) + deleted(8) + last_gc_ts(8) = 29 bytes
-    const expected_size: usize = 4 + 1 + 8 + 8 + 8;
-    try std.testing.expectEqual(@as(usize, 29), expected_size);
+    // Header format: magic(4) + version(1) + count(8) + deleted(8) + last_gc_ts(8) + system_store_key_exists(1) + system_store_key(16) = 46 bytes
+    const expected_size: usize = 4 + 1 + 8 + 8 + 8 + 1 + 16;
+    try std.testing.expectEqual(@as(usize, 46), expected_size);
 }
 
 test "vlog - Header serialization roundtrip" {
@@ -230,15 +241,19 @@ test "vlog - Header serialization roundtrip" {
         .count = 42,
         .deleted = 5,
         .last_gc_ts = 9876543210,
+        .system_store_key_exists = true,
+        .system_store_key = 12345678901234567890,
     };
 
     // Serialize
-    var buf: [29]u8 = undefined;
+    var buf: [46]u8 = undefined;
     mem.writeInt(u32, buf[0..4], original.magic, .little);
     buf[4] = original.version;
     mem.writeInt(u64, buf[5..13], original.count, .little);
     mem.writeInt(u64, buf[13..21], original.deleted, .little);
     mem.writeInt(i64, buf[21..29], original.last_gc_ts, .little);
+    buf[29] = if (original.system_store_key_exists) 1 else 0;
+    mem.writeInt(u128, buf[30..46], original.system_store_key, .little);
 
     // Deserialize
     const magic = mem.readInt(u32, buf[0..4], .little);
@@ -246,12 +261,16 @@ test "vlog - Header serialization roundtrip" {
     const count = mem.readInt(u64, buf[5..13], .little);
     const deleted = mem.readInt(u64, buf[13..21], .little);
     const last_gc_ts = mem.readInt(i64, buf[21..29], .little);
+    const system_store_key_exists = buf[29] != 0;
+    const system_store_key = mem.readInt(u128, buf[30..46], .little);
 
     try std.testing.expectEqual(original.magic, magic);
     try std.testing.expectEqual(original.version, version);
     try std.testing.expectEqual(original.count, count);
     try std.testing.expectEqual(original.deleted, deleted);
     try std.testing.expectEqual(original.last_gc_ts, last_gc_ts);
+    try std.testing.expectEqual(original.system_store_key_exists, system_store_key_exists);
+    try std.testing.expectEqual(original.system_store_key, system_store_key);
 }
 
 test "vlog - VLogConfig struct" {

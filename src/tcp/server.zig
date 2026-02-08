@@ -17,6 +17,7 @@ const BufferWriter = proto.BufferWriter;
 const SecurityManager = @import("../storage/security.zig").SecurityManager;
 const Session_Security = @import("../storage/security.zig").Session;
 const PermissionType = @import("../storage/security.zig").PermissionType;
+const bson = @import("bson");
 
 const log = std.log.scoped(.server);
 
@@ -277,7 +278,6 @@ pub const Session = struct {
         }
     }
 
-
     fn processMessage(self: *Self, payload: []const u8) !?[]u8 {
         // Deserialize the incoming packet
         const request = try Packet.deserialize(self.allocator, payload);
@@ -288,7 +288,7 @@ pub const Session = struct {
             // On error, return an error response with appropriate status
             log.err("Error handling operation: {}", .{err});
             const error_msg = try std.fmt.allocPrint(self.allocator, "Error: {}", .{err});
-            defer self.allocator.free(error_msg);
+            // Note: error_msg will be freed when the client processes the Reply
 
             // Map error to appropriate status
             const status: Status = switch (err) {
@@ -297,7 +297,7 @@ pub const Session = struct {
                 else => .err,
             };
 
-            const error_op = Operation{ .Reply = .{ .status = status, .data = null } };
+            const error_op = Operation{ .Reply = .{ .status = status, .data = error_msg } };
 
             const response = Packet{
                 .checksum = 0,
@@ -422,7 +422,7 @@ pub const Session = struct {
 
                 switch (data.doc_type) {
                     .Space => {
-                        _ = try self.engine.catalog.createSpace(data.ns, data.metadata, self.engine.db);
+                        _ = try self.engine.catalog.createSpace(data.ns, data.metadata);
                         break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                     },
                     .Store => {
@@ -433,45 +433,21 @@ pub const Session = struct {
 
                             if (parts.space) |space_ns| {
                                 if (self.engine.catalog.spaces.get(space_ns) == null) {
-                                    _ = try self.engine.catalog.createSpace(space_ns, null, self.engine.db);
+                                    _ = try self.engine.catalog.createSpace(space_ns, null);
                                 }
                             }
                         }
-                        _ = try self.engine.catalog.createStore(data.ns, data.metadata, self.engine.db);
+                        _ = try self.engine.catalog.createStore(data.ns, data.metadata);
                         break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                     },
                     .Index => {
-                        // Parse payload as JSON to get field name and type
-                        const parsed = try std.json.parseFromSlice(
-                            std.json.Value,
-                            self.allocator,
-                            data.payload,
-                            .{},
-                        );
-                        defer parsed.deinit();
+                        // Decode BSON payload to get Index struct
+                        var decoder = bson.Decoder.init(self.allocator, data.payload);
+                        const index = try decoder.decode(proto.Index);
+                        defer self.allocator.free(index.field);
 
-                        const field = parsed.value.object.get("field") orelse return error.MissingField;
-                        const field_type_str = parsed.value.object.get("field_type") orelse return error.MissingFieldType;
-
-                        // Parse field type
-                        const field_type: proto.FieldType = if (std.mem.eql(u8, field_type_str.string, "String"))
-                            .String
-                        else if (std.mem.eql(u8, field_type_str.string, "U32"))
-                            .U32
-                        else if (std.mem.eql(u8, field_type_str.string, "U64"))
-                            .U64
-                        else if (std.mem.eql(u8, field_type_str.string, "I32"))
-                            .I32
-                        else if (std.mem.eql(u8, field_type_str.string, "I64"))
-                            .I64
-                        else if (std.mem.eql(u8, field_type_str.string, "F32"))
-                            .F32
-                        else if (std.mem.eql(u8, field_type_str.string, "F64"))
-                            .F64
-                        else if (std.mem.eql(u8, field_type_str.string, "Boolean"))
-                            .Boolean
-                        else
-                            return error.InvalidFieldType;
+                        const field = index.field;
+                        const field_type = index.field_type;
 
                         // Get store_ns from index namespace (space.store.index -> space.store)
                         var parts = try proto.parseNamespace(self.allocator, data.ns);
@@ -490,38 +466,33 @@ pub const Session = struct {
                         // This also populates the index with existing documents
                         self.engine.db_mutex.lock();
                         defer self.engine.db_mutex.unlock();
-                        try self.engine.db.createSecondaryIndex(store_id, data.ns, field.string, field_type);
+                        try self.engine.db.createSecondaryIndex(store_id, data.ns, field, field_type);
                         break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                     },
                     .User => {
-                        // Parse payload as JSON to get username, password, role
-                        const parsed = try std.json.parseFromSlice(
-                            std.json.Value,
-                            self.allocator,
-                            data.payload,
-                            .{},
-                        );
-                        defer parsed.deinit();
-
-                        const username = parsed.value.object.get("username") orelse return error.MissingUsername;
-                        const password = parsed.value.object.get("password") orelse return error.MissingPassword;
-                        const role_num = parsed.value.object.get("role") orelse return error.MissingRole;
+                        // Decode BSON payload to get User struct
+                        var decoder = bson.Decoder.init(self.allocator, data.payload);
+                        const user_data = try decoder.decode(proto.User);
+                        defer {
+                            self.allocator.free(user_data.username);
+                            self.allocator.free(user_data.password_hash);
+                        }
 
                         const Role = @import("../storage/security.zig").Role;
-                        const role: Role = switch (role_num.integer) {
+                        const role: Role = switch (user_data.role) {
                             0 => .admin,
                             1 => .read_write,
                             2 => .read_only,
                             else => .none,
                         };
 
-                        self.security_manager.createUser(username.string, password.string, role) catch |err| {
+                        self.security_manager.createUser(user_data.username, user_data.password_hash, role) catch |err| {
                             const err_msg = try std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
                             break :blk Operation{ .Reply = .{ .status = .err, .data = err_msg } };
                         };
 
                         // Return API key
-                        const user = self.security_manager.users.get(username.string) orelse {
+                        const user = self.security_manager.users.get(user_data.username) orelse {
                             break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                         };
                         const response = try std.fmt.allocPrint(self.allocator, "{{\"api_key\":\"{s}\"}}", .{user.api_key});
@@ -543,15 +514,15 @@ pub const Session = struct {
 
                 switch (data.doc_type) {
                     .Space => {
-                        try self.engine.catalog.dropSpace(data.name, self.engine.db);
+                        try self.engine.catalog.dropSpace(data.name);
                         break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                     },
                     .Store => {
-                        try self.engine.catalog.dropStore(data.name, self.engine.db);
+                        try self.engine.catalog.dropStore(data.name);
                         break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                     },
                     .Index => {
-                        try self.engine.catalog.dropIndex(data.name, self.engine.db);
+                        try self.engine.catalog.dropIndex(data.name);
                         break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                     },
                     .User => {
@@ -577,101 +548,24 @@ pub const Session = struct {
 
                 switch (data.doc_type) {
                     .Space => {
-                        var spaces = try self.engine.catalog.listSpaces(self.allocator);
-                        defer spaces.deinit(self.allocator);
-
-                        // Format as JSON array of space namespaces
-                        var json_buf: std.ArrayList(u8) = .empty;
-                        try json_buf.append(self.allocator, '[');
-                        for (spaces.items, 0..) |space, i| {
-                            if (i > 0) try json_buf.append(self.allocator, ',');
-                            try json_buf.append(self.allocator, '"');
-                            try json_buf.appendSlice(self.allocator, space.ns);
-                            try json_buf.append(self.allocator, '"');
-                        }
-                        try json_buf.append(self.allocator, ']');
-                        break :blk Operation{ .Reply = .{ .status = .ok, .data = try json_buf.toOwnedSlice(self.allocator) } };
+                        const bson_data = try self.engine.catalog.listSpacesBson(self.allocator, data.ns);
+                        break :blk Operation{ .Reply = .{ .status = .ok, .data = bson_data } };
                     },
                     .Store => {
-                        var stores = try self.engine.catalog.listStores(self.allocator);
-                        defer stores.deinit(self.allocator);
-
-                        // Filter by space namespace prefix if provided
-                        var json_buf: std.ArrayList(u8) = .empty;
-                        try json_buf.append(self.allocator, '[');
-                        var first = true;
-                        for (stores.items) |store| {
-                            // Check if store belongs to the specified space (if ns filter provided)
-                            if (data.ns) |filter_ns| {
-                                if (std.mem.startsWith(u8, store.ns, filter_ns)) {
-                                    if (!first) try json_buf.append(self.allocator, ',');
-                                    first = false;
-                                    try json_buf.append(self.allocator, '"');
-                                    try json_buf.appendSlice(self.allocator, store.ns);
-                                    try json_buf.append(self.allocator, '"');
-                                }
-                            } else {
-                                // No filter, include all stores
-                                if (!first) try json_buf.append(self.allocator, ',');
-                                first = false;
-                                try json_buf.append(self.allocator, '"');
-                                try json_buf.appendSlice(self.allocator, store.ns);
-                                try json_buf.append(self.allocator, '"');
-                            }
-                        }
-                        try json_buf.append(self.allocator, ']');
-                        break :blk Operation{ .Reply = .{ .status = .ok, .data = try json_buf.toOwnedSlice(self.allocator) } };
+                        const bson_data = try self.engine.catalog.listStoresBson(self.allocator, data.ns);
+                        break :blk Operation{ .Reply = .{ .status = .ok, .data = bson_data } };
                     },
                     .Index => {
-                        var indexes = try self.engine.catalog.listIndexes(self.allocator);
-                        defer indexes.deinit(self.allocator);
-
-                        // Filter by store namespace prefix if provided
-                        var json_buf: std.ArrayList(u8) = .empty;
-                        try json_buf.append(self.allocator, '[');
-                        var first = true;
-                        for (indexes.items) |index| {
-                            // Check if index belongs to the specified store (if ns filter provided)
-                            if (data.ns) |filter_ns| {
-                                if (std.mem.startsWith(u8, index.ns, filter_ns)) {
-                                    if (!first) try json_buf.append(self.allocator, ',');
-                                    first = false;
-                                    try json_buf.append(self.allocator, '"');
-                                    try json_buf.appendSlice(self.allocator, index.ns);
-                                    try json_buf.append(self.allocator, '"');
-                                }
-                            } else {
-                                // No filter, include all indexes
-                                if (!first) try json_buf.append(self.allocator, ',');
-                                first = false;
-                                try json_buf.append(self.allocator, '"');
-                                try json_buf.appendSlice(self.allocator, index.ns);
-                                try json_buf.append(self.allocator, '"');
-                            }
-                        }
-                        try json_buf.append(self.allocator, ']');
-                        break :blk Operation{ .Reply = .{ .status = .ok, .data = try json_buf.toOwnedSlice(self.allocator) } };
+                        const bson_data = try self.engine.catalog.listIndexesBson(self.allocator, data.ns);
+                        break :blk Operation{ .Reply = .{ .status = .ok, .data = bson_data } };
                     },
                     .User => {
-                        // List all users (returns usernames only for security)
-                        var json_buf: std.ArrayList(u8) = .empty;
-                        try json_buf.append(self.allocator, '[');
-                        var first = true;
-                        var user_iter = self.security_manager.users.iterator();
-                        while (user_iter.next()) |entry| {
-                            if (!first) try json_buf.append(self.allocator, ',');
-                            first = false;
-                            try json_buf.append(self.allocator, '"');
-                            try json_buf.appendSlice(self.allocator, entry.key_ptr.*);
-                            try json_buf.append(self.allocator, '"');
-                        }
-                        try json_buf.append(self.allocator, ']');
-                        break :blk Operation{ .Reply = .{ .status = .ok, .data = try json_buf.toOwnedSlice(self.allocator) } };
+                        const bson_data = try self.engine.catalog.listUsersBson(self.allocator);
+                        break :blk Operation{ .Reply = .{ .status = .ok, .data = bson_data } };
                     },
                     .Backup => {
-                        // TODO: Not implemented yet
-                        const err_data = try self.allocator.dupe(u8, "Not implemented");
-                        break :blk Operation{ .Reply = .{ .status = .err, .data = err_data } };
+                        const bson_data = try self.engine.catalog.listBackupsBson(self.allocator);
+                        break :blk Operation{ .Reply = .{ .status = .ok, .data = bson_data } };
                     },
                     .Document => {
                         return error.InvalidDocType;

@@ -16,6 +16,10 @@ const milliTimestamp = common.milliTimestamp;
 const KeyGen = @import("../common/keygen.zig").KeyGen;
 const Catalog = @import("../storage/catalog.zig").Catalog;
 const LruCache = @import("../storage/lru_cache.zig").LruCache;
+const bson = @import("bson");
+const query_engine = @import("../storage/query_engine.zig");
+const FieldExtractor = @import("../storage/field_extractor.zig").FieldExtractor;
+const FieldValue = @import("../storage/field_extractor.zig").FieldValue;
 
 const log = std.log.scoped(.engine);
 
@@ -65,8 +69,11 @@ pub const Engine = struct {
         const db = try Db.init(allocator, config, io, primary_index_ptr);
         errdefer db.deinit();
 
-        // Load catalog entries from database
-        try db.catalog.loadFromDb(db);
+        // Load catalog entries from metadata file
+        try db.catalog.loadMetadata();
+
+        // Load secondary indexes from persisted catalog
+        try loadSecondaryIndexesFromCatalog(db, allocator, config, io);
 
         // Initialize WAL if durability is enabled
         var wal: ?*WriteAheadLog = null;
@@ -194,6 +201,48 @@ pub const Engine = struct {
         };
 
         log.info("Database directories initialized", .{});
+    }
+
+    /// Load secondary indexes from persisted catalog metadata
+    /// Called on startup to reopen index files that were created in previous sessions
+    fn loadSecondaryIndexesFromCatalog(db: *Db, allocator: Allocator, config: *Config, io: Io) !void {
+        // Get all indexes from catalog
+        var indexes = try db.catalog.listIndexes(allocator);
+        defer indexes.deinit(allocator);
+
+        var count: usize = 0;
+        for (indexes.items) |index_meta| {
+            // Skip system indexes
+            if (index_meta.store_id == 0) continue;
+
+            // Check if this index is already loaded
+            if (db.secondary_indexes.contains(index_meta.ns)) {
+                continue; // Already loaded
+            }
+
+            // Open the B+ tree index file
+            const index_ptr = try allocator.create(Index([]const u8, void));
+            errdefer allocator.destroy(index_ptr);
+
+            // Duplicate the index_ns since it may be freed by the caller
+            const index_ns_owned = try allocator.dupe(u8, index_meta.ns);
+            errdefer allocator.free(index_ns_owned);
+
+            index_ptr.* = try Index([]const u8, void).init(allocator, .{
+                .dir_path = config.paths.index,
+                .file_name = index_ns_owned,
+                .pool_size = config.index.primary.pool_size,
+                .io = io,
+            });
+
+            try db.secondary_indexes.put(index_ns_owned, index_ptr);
+            count += 1;
+            log.info("Loaded secondary index '{s}' for store_id {}", .{ index_meta.ns, index_meta.store_id });
+        }
+
+        if (count > 0) {
+            log.info("Loaded {} secondary indexes from catalog", .{count});
+        }
     }
 
     /// Post a new entry (insert with auto-generated key)
@@ -413,9 +462,6 @@ pub const Engine = struct {
     /// Currently supports single criterion queries
     pub fn findDocs(self: *Self, index_ns: []const u8, field_value: anytype, limit: ?u32) ![]Entry {
         const actual_limit = limit orelse 100;
-
-        // Import FieldValue type
-        const FieldValue = @import("../storage/field_extractor.zig").FieldValue;
 
         // Convert field_value to FieldValue union
         const fv = switch (@TypeOf(field_value)) {
@@ -660,7 +706,6 @@ pub const Engine = struct {
     /// Query documents using JSON query language
     /// Supports filtering, sorting, and pagination
     pub fn queryDocs(self: *Self, store_ns: []const u8, query_json: []const u8) ![]Entry {
-        const query_engine = @import("../storage/query_engine.zig");
 
         // Parse JSON query
         var parsed = try query_engine.parseJsonQuery(self.allocator, query_json);
@@ -1038,9 +1083,6 @@ pub const Engine = struct {
     }
 
     pub fn aggregateDocs(self: *Self, store_ns: []const u8, query_json: []const u8) ![]u8 {
-        const query_engine = @import("../storage/query_engine.zig");
-        const field_extractor = @import("../storage/field_extractor.zig");
-        const FieldExtractor = field_extractor.FieldExtractor;
         const GroupAccumulator = query_engine.GroupAccumulator;
 
         // Parse JSON query
@@ -1108,15 +1150,15 @@ pub const Engine = struct {
 
                 // Accumulate each aggregation
                 for (p.aggregations.items) |agg| {
-                    const field_value: ?field_extractor.FieldValue = if (agg.field_name) |fn_name| blk: {
+                    const field_value: ?FieldValue = if (agg.field_name) |fn_name| blk: {
                         if (try ext.extractI64(value, fn_name)) |i| {
-                            break :blk field_extractor.FieldValue{ .i64_val = i };
+                            break :blk FieldValue{ .i64_val = i };
                         }
                         if (try ext.extractF64(value, fn_name)) |f| {
-                            break :blk field_extractor.FieldValue{ .f64_val = f };
+                            break :blk FieldValue{ .f64_val = f };
                         }
                         if (try ext.extractU64(value, fn_name)) |u| {
-                            break :blk field_extractor.FieldValue{ .u64_val = u };
+                            break :blk FieldValue{ .u64_val = u };
                         }
                         break :blk null;
                     } else null;
@@ -1332,32 +1374,144 @@ pub const Engine = struct {
 // ============================================================================
 
 /// Check if a JSON document matches a predicate
-fn matchesPredicate(doc_json: []const u8, pred: @import("../storage/query_engine.zig").Predicate) bool {
-    // Parse document JSON to extract field value
-    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, doc_json, .{}) catch return false;
-    defer parsed.deinit();
+fn matchesPredicate(doc_bson: []const u8, pred: query_engine.Predicate) bool {
+    // Client always sends BSON, so we only need to parse as BSON
+    const doc_result = bson.BsonDocument.init(std.heap.page_allocator, doc_bson, false);
 
-    if (parsed.value != .object) return false;
+    if (doc_result) |doc| {
+        var mutable_doc = doc;
+        defer mutable_doc.deinit();
 
-    const field_val = parsed.value.object.get(pred.field_name) orelse return false;
+        // Try to get the field value from BSON
+        if (doc.getField(pred.field_name)) |field_value_opt| {
+            if (field_value_opt) |field_value| {
+                // Compare BSON value with predicate value
+                const result = compareBsonValue(field_value, pred.value, pred.operator);
+                std.debug.print("[MATCH] field={s} op={any} bson_val={any} pred_val={any} result={}\n", .{ pred.field_name, pred.operator, field_value, pred.value, result });
+                return result;
+            } else {
+                std.debug.print("[MATCH] field={s} not found in doc\n", .{pred.field_name});
+            }
+        } else |err| {
+            // Field not found or error reading it
+            std.debug.print("[MATCH] field={s} error: {any}\n", .{ pred.field_name, err });
+            return false;
+        }
+        return false;
+    } else |err| {
+        // BSON parsing failed - this shouldn't happen if client sends valid BSON
+        std.debug.print("[MATCH] BSON parse failed: {any}\n", .{err});
+        return false;
+    }
+}
 
-    // Compare based on operator
-    return switch (pred.operator) {
-        .eq => compareJsonValue(field_val, pred.value, .eq),
-        .ne => !compareJsonValue(field_val, pred.value, .eq),
-        .gt => compareJsonValue(field_val, pred.value, .gt),
-        .gte => compareJsonValue(field_val, pred.value, .gt) or compareJsonValue(field_val, pred.value, .eq),
-        .lt => compareJsonValue(field_val, pred.value, .lt),
-        .lte => compareJsonValue(field_val, pred.value, .lt) or compareJsonValue(field_val, pred.value, .eq),
-        .contains => containsString(field_val, pred.value),
-        .starts_with => startsWithString(field_val, pred.value),
-        .in => false, // TODO: implement IN operator
+const QueryOperator = query_engine.Operator;
+
+/// Compare a BSON Value with a FieldValue using an operator
+fn compareBsonValue(bson_val: bson.Value, field_val: FieldValue, op: QueryOperator) bool {
+    return switch (bson_val) {
+        .string => |s| blk: {
+            if (field_val != .string) break :blk false;
+            break :blk switch (op) {
+                .eq => std.mem.eql(u8, s, field_val.string),
+                .ne => !std.mem.eql(u8, s, field_val.string),
+                .gt => std.mem.order(u8, s, field_val.string) == .gt,
+                .gte => std.mem.order(u8, s, field_val.string) != .lt,
+                .lt => std.mem.order(u8, s, field_val.string) == .lt,
+                .lte => std.mem.order(u8, s, field_val.string) != .gt,
+                else => false,
+            };
+        },
+        .int32 => |i| {
+            const i64_val: i64 = i;
+            return compareInt64Value(i64_val, field_val, op);
+        },
+        .int64 => |i| {
+            return compareInt64Value(i, field_val, op);
+        },
+        .double => |d| blk: {
+            if (field_val != .f64_val) break :blk false;
+            break :blk switch (op) {
+                .eq => d == field_val.f64_val,
+                .ne => d != field_val.f64_val,
+                .gt => d > field_val.f64_val,
+                .gte => d >= field_val.f64_val,
+                .lt => d < field_val.f64_val,
+                .lte => d <= field_val.f64_val,
+                else => false,
+            };
+        },
+        .boolean => |b| blk: {
+            if (field_val != .bool_val) break :blk false;
+            break :blk switch (op) {
+                .eq => b == field_val.bool_val,
+                .ne => b != field_val.bool_val,
+                else => false,
+            };
+        },
+        .null => false,
+        else => false,
+    };
+}
+
+fn compareInt64Value(i64_val: i64, field_val: FieldValue, op: QueryOperator) bool {
+    return switch (field_val) {
+        .i64_val => |expected| blk: {
+            break :blk switch (op) {
+                .eq => i64_val == expected,
+                .ne => i64_val != expected,
+                .gt => i64_val > expected,
+                .gte => i64_val >= expected,
+                .lt => i64_val < expected,
+                .lte => i64_val <= expected,
+                else => false,
+            };
+        },
+        .i32_val => |expected| blk: {
+            const expected_i64: i64 = expected;
+            break :blk switch (op) {
+                .eq => i64_val == expected_i64,
+                .ne => i64_val != expected_i64,
+                .gt => i64_val > expected_i64,
+                .gte => i64_val >= expected_i64,
+                .lt => i64_val < expected_i64,
+                .lte => i64_val <= expected_i64,
+                else => false,
+            };
+        },
+        .u64_val => |expected| blk: {
+            if (i64_val < 0) break :blk false;
+            const u64_val: u64 = @intCast(i64_val);
+            break :blk switch (op) {
+                .eq => u64_val == expected,
+                .ne => u64_val != expected,
+                .gt => u64_val > expected,
+                .gte => u64_val >= expected,
+                .lt => u64_val < expected,
+                .lte => u64_val <= expected,
+                else => false,
+            };
+        },
+        .u32_val => |expected| blk: {
+            if (i64_val < 0) break :blk false;
+            const u32_val: u32 = @intCast(i64_val);
+            break :blk switch (op) {
+                .eq => u32_val == expected,
+                .ne => u32_val != expected,
+                .gt => u32_val > expected,
+                .gte => u32_val >= expected,
+                .lt => u32_val < expected,
+                .lte => u32_val <= expected,
+                else => false,
+            };
+        },
+        else => false,
     };
 }
 
 const CompareOp = enum { eq, gt, lt };
 
-fn compareJsonValue(json_val: std.json.Value, field_val: @import("../storage/field_extractor.zig").FieldValue, op: CompareOp) bool {
+fn compareJsonValue(json_val: std.json.Value, field_val: FieldValue, op: CompareOp) bool {
     return switch (field_val) {
         .string => |s| blk: {
             if (json_val != .string) break :blk false;
@@ -1421,13 +1575,13 @@ fn compareJsonValue(json_val: std.json.Value, field_val: @import("../storage/fie
     };
 }
 
-fn containsString(json_val: std.json.Value, field_val: @import("../storage/field_extractor.zig").FieldValue) bool {
+fn containsString(json_val: std.json.Value, field_val: FieldValue) bool {
     if (json_val != .string) return false;
     if (field_val != .string) return false;
     return std.mem.indexOf(u8, json_val.string, field_val.string) != null;
 }
 
-fn startsWithString(json_val: std.json.Value, field_val: @import("../storage/field_extractor.zig").FieldValue) bool {
+fn startsWithString(json_val: std.json.Value, field_val: FieldValue) bool {
     if (json_val != .string) return false;
     if (field_val != .string) return false;
     return std.mem.startsWith(u8, json_val.string, field_val.string);

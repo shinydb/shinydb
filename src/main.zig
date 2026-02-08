@@ -28,9 +28,9 @@ fn benchmarkEngine(allocator: std.mem.Allocator, config: *Config, io: Io) !void 
         engine.catalog_mutex.lock();
         defer engine.catalog_mutex.unlock();
         // Create space if it doesn't exist
-        _ = engine.catalog.createSpace("benchmark", "Benchmark space", engine.db) catch {};
+        _ = engine.catalog.createSpace("benchmark", "Benchmark space") catch {};
         // Create store if it doesn't exist
-        _ = engine.catalog.createStore(store_ns, "Benchmark store", engine.db) catch {};
+        _ = engine.catalog.createStore(store_ns, "Benchmark store") catch {};
     }
 
     const operation_count: usize = 1_000_000;
@@ -133,4 +133,3 @@ pub fn main() !void {
         return err;
     };
 }
-

@@ -433,7 +433,7 @@ pub const SecurityManager = struct {
         }
 
         // Store doesn't exist, create it
-        const store = try engine.catalog.createStore(SYSTEM_USERS_STORE_NS, "System user accounts", engine.db);
+        const store = try engine.catalog.createStore(SYSTEM_USERS_STORE_NS, "System user accounts");
         self.users_store_id = store.id;
     }
 

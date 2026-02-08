@@ -5,10 +5,6 @@ const Dir = Io.Dir;
 const File = Io.File;
 const ValueLog = @import("vlog.zig").ValueLog;
 const VLogConfig = @import("vlog.zig").VLogConfig;
-const TxnManager = @import("transaction.zig").TxnManager;
-const Transaction = @import("transaction.zig").Transaction;
-const IsolationLevel = @import("transaction.zig").IsolationLevel;
-const TxnId = @import("transaction.zig").TxnId;
 const BackupManager = @import("backup.zig").BackupManager;
 const BackupMetadata = @import("backup.zig").BackupMetadata;
 const MetricsCollector = @import("metrics.zig").MetricsCollector;
@@ -97,8 +93,7 @@ pub const Db = struct {
     gc_metrics: GcMetrics,
     gc_thread: ?std.Thread = null,
     gc_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    // Transaction Manager
-    txn_manager: *TxnManager,
+
     // Metrics Collector
     metrics_collector: *MetricsCollector,
     // Compressor
@@ -106,11 +101,13 @@ pub const Db = struct {
     // Write-Ahead Log for crash recovery
     wal: *WriteAheadLog,
 
+    // Bootstrap key for system store recovery (O(1) lookup instead of scanning 10M primary index keys)
+    system_store_key: u128 = 0,
+
     pub fn init(allocator: Allocator, config: *Config, io: Io, primary_index: *Index(u128, u64)) !*Db {
         const db = try allocator.create(Db);
 
-        const catalog = try Catalog.init(allocator);
-        const txn_manager = try TxnManager.init(allocator);
+        const catalog = try Catalog.init(allocator, config.paths.metadata, io);
         const metrics_collector = try MetricsCollector.init(allocator);
         const compressor = try Compressor.init(allocator, CompressionConfig{});
 
@@ -138,13 +135,15 @@ pub const Db = struct {
             .tail_vlog_id = 0,
             .gc_config = GcConfig{},
             .gc_metrics = GcMetrics{},
-            .txn_manager = txn_manager,
             .metrics_collector = metrics_collector,
             .compressor = compressor,
             .wal = wal,
         };
 
         try db.load_vlogs();
+
+        // Initialize system_store_key for bootstrap recovery
+        try db.initSystemStoreKey();
 
         // Crash Recovery: Replay WAL logs
         const replay_result = try wal.replay();
@@ -259,7 +258,6 @@ pub const Db = struct {
         self.secondary_indexes.deinit();
 
         self.catalog.deinit();
-        self.txn_manager.deinit();
         self.metrics_collector.deinit();
         self.compressor.deinit();
         self.wal.deinit() catch {};
@@ -341,6 +339,45 @@ pub const Db = struct {
         }
     }
 
+    fn initSystemStoreKey(self: *Db) !void {
+        // Check if system_store_key exists in any vlog header
+        var iter = self.vlogs.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.*.header.system_store_key_exists) {
+                self.system_store_key = entry.value_ptr.*.header.system_store_key;
+                log.info("Loaded system_store_key from vlog {d}: {d}", .{ entry.key_ptr.*, self.system_store_key });
+                return;
+            }
+        }
+
+        // If no system_store_key found, generate a new one
+        var keygen = KeyGen.init();
+        self.system_store_key = try keygen.Gen(0, 0, 1); // store_id=0, doc_type=1 for primary index
+        log.info("Generated new system_store_key: {d}", .{self.system_store_key});
+
+        // Update all vlog headers with the new system_store_key
+        var vlog_iter = self.vlogs.iterator();
+        while (vlog_iter.next()) |entry| {
+            entry.value_ptr.*.header.system_store_key_exists = true;
+            entry.value_ptr.*.header.system_store_key = self.system_store_key;
+
+            // Serialize and write updated header to file
+            var header_buf: [46]u8 = undefined;
+            std.mem.writeInt(u32, header_buf[0..4], entry.value_ptr.*.header.magic, .little);
+            header_buf[4] = entry.value_ptr.*.header.version;
+            std.mem.writeInt(u64, header_buf[5..13], entry.value_ptr.*.header.count, .little);
+            std.mem.writeInt(u64, header_buf[13..21], entry.value_ptr.*.header.deleted, .little);
+            std.mem.writeInt(i64, header_buf[21..29], entry.value_ptr.*.header.last_gc_ts, .little);
+            header_buf[29] = if (entry.value_ptr.*.header.system_store_key_exists) 1 else 0;
+            std.mem.writeInt(u128, header_buf[30..46], entry.value_ptr.*.header.system_store_key, .little);
+
+            try entry.value_ptr.*.file.writePositionalAll(self.io, &header_buf, 0);
+            try entry.value_ptr.*.file.sync(self.io);
+        }
+
+        log.info("Updated all vlog headers with system_store_key", .{});
+    }
+
     pub fn post(self: *Db, entry: Entry) !void {
 
         // Post to memtable
@@ -413,7 +450,7 @@ pub const Db = struct {
     /// This will create the index structure and populate it by scanning the primary index
     pub fn createSecondaryIndex(self: *Db, store_id: u16, index_ns: []const u8, field_name: []const u8, field_type: proto.FieldType) !void {
         // Create index in catalog with store_id
-        _ = try self.catalog.createIndexForStore(store_id, index_ns, field_name, field_type, false, self);
+        _ = try self.catalog.createIndexForStore(store_id, index_ns, field_name, field_type, false);
 
         // Duplicate the index_ns since it may be freed by the caller
         const index_ns_owned = try self.allocator.dupe(u8, index_ns);
@@ -531,6 +568,12 @@ pub const Db = struct {
             }
         }
 
+        // Flush to persist the index metadata to catalog
+        try self.flush();
+
+        // Flush the secondary index B+ tree to disk
+        try index_ptr.flush();
+
         // Index created successfully
     }
 
@@ -641,6 +684,47 @@ pub const Db = struct {
         offset += 16;
 
         return buf[0..offset];
+    }
+
+    /// Convert a query FieldValue to match the index's field_type.
+    /// The query parser always produces i64_val for integer literals, but the
+    /// index may have been built with u32_val, i32_val, u64_val, etc.
+    /// Without conversion, the composite key byte length won't match.
+    fn convertFieldValue(fv: FieldValue, target_type: proto.FieldType) FieldValue {
+        return switch (target_type) {
+            .U32 => switch (fv) {
+                .i64_val => |v| FieldValue{ .u32_val = @intCast(v) },
+                .i32_val => |v| FieldValue{ .u32_val = @intCast(v) },
+                .u64_val => |v| FieldValue{ .u32_val = @intCast(v) },
+                else => fv,
+            },
+            .I32 => switch (fv) {
+                .i64_val => |v| FieldValue{ .i32_val = @intCast(v) },
+                .u32_val => |v| FieldValue{ .i32_val = @intCast(v) },
+                .u64_val => |v| FieldValue{ .i32_val = @intCast(v) },
+                else => fv,
+            },
+            .U64 => switch (fv) {
+                .i64_val => |v| FieldValue{ .u64_val = @intCast(v) },
+                .i32_val => |v| FieldValue{ .u64_val = @intCast(v) },
+                .u32_val => |v| FieldValue{ .u64_val = v },
+                else => fv,
+            },
+            .I64 => switch (fv) {
+                .u64_val => |v| FieldValue{ .i64_val = @intCast(v) },
+                .i32_val => |v| FieldValue{ .i64_val = v },
+                .u32_val => |v| FieldValue{ .i64_val = v },
+                else => fv,
+            },
+            .F64 => switch (fv) {
+                .i64_val => |v| FieldValue{ .f64_val = @floatFromInt(v) },
+                .i32_val => |v| FieldValue{ .f64_val = @floatFromInt(v) },
+                .u64_val => |v| FieldValue{ .f64_val = @floatFromInt(v) },
+                .u32_val => |v| FieldValue{ .f64_val = @floatFromInt(v) },
+                else => fv,
+            },
+            else => fv,
+        };
     }
 
     /// Update vlog statistics after a write
@@ -924,9 +1008,13 @@ pub const Db = struct {
 
             while (iter.next()) |entry| {
                 flush_total += 1;
-                const metadata = KeyGen.extractMetadata(entry.key);
 
-                if (self.vlogs.get(metadata.vlog_id)) |vlog| {
+                // Extract metadata from key using KeyGen format
+                // store_id (bits 112-127) | doc_type (bits 104-111) | vlog_id (bits 96-103) | random (bits 0-95)
+                const metadata = KeyGen.extractMetadata(entry.key);
+                const vlog_id = metadata.vlog_id;
+
+                if (self.vlogs.get(vlog_id)) |vlog| {
                     // Check if key already exists and mark old value as dead
                     if (try self.primary_index.search(entry.key)) |old_offset| {
                         try self.markValueAsDead(entry.key, old_offset);
@@ -945,7 +1033,7 @@ pub const Db = struct {
                         self.metrics.vlog_writes.stop();
 
                         // Update vlog stats
-                        try self.updateVlogStats(metadata.vlog_id, vlog_entry.size(), true);
+                        try self.updateVlogStats(vlog_id, vlog_entry.size(), true);
 
                         // Update primary index with tombstone offset
                         try self.primary_index.insert(entry.key, offset);
@@ -964,7 +1052,7 @@ pub const Db = struct {
                         self.metrics.vlog_writes.stop();
 
                         // Update vlog stats
-                        try self.updateVlogStats(metadata.vlog_id, vlog_entry.size(), false);
+                        try self.updateVlogStats(vlog_id, vlog_entry.size(), false);
 
                         // Update primary index with actual offset from vlog
                         try self.primary_index.insert(entry.key, offset);
@@ -974,7 +1062,7 @@ pub const Db = struct {
                     }
                 } else {
                     flush_skipped += 1;
-                    log.warn("Flush: skipping entry - vlog_id={d} not found in vlogs map", .{metadata.vlog_id});
+                    log.warn("Flush: skipping entry - vlog_id={d} not found in vlogs map", .{vlog_id});
                 }
             }
 
@@ -988,6 +1076,12 @@ pub const Db = struct {
             // Flush primary index to disk to ensure durability
             try self.primary_index.flush();
             log.info("Primary index flushed to disk", .{});
+
+            // Flush all secondary indexes to disk
+            var sec_iter = self.secondary_indexes.iterator();
+            while (sec_iter.next()) |sec_entry| {
+                try sec_entry.value_ptr.*.flush();
+            }
 
             // Checkpoint WAL after successful flush
             try self.wal.checkpoint();
@@ -1003,12 +1097,22 @@ pub const Db = struct {
         // Get the secondary index
         const index = self.secondary_indexes.get(index_ns) orelse return error.IndexNotFound;
 
+        // Look up the index metadata to get the field_type so we can convert
+        // the query FieldValue to match the type the index was built with.
+        // The query parser always produces i64_val for integers, but the index
+        // may have been built with u32_val, i32_val, etc.
+        const index_meta = self.catalog.indexes.get(index_ns);
+        const converted_fv = if (index_meta) |meta|
+            convertFieldValue(field_value, meta.field_type)
+        else
+            field_value;
+
         // Create composite key range for the field value
         var start_key_buf: [256]u8 = undefined;
         var end_key_buf: [256]u8 = undefined;
 
-        const start_key = try self.makeCompositeKey(&start_key_buf, field_value, 0);
-        const end_key = try self.makeCompositeKey(&end_key_buf, field_value, std.math.maxInt(u128));
+        const start_key = try self.makeCompositeKey(&start_key_buf, converted_fv, 0);
+        const end_key = try self.makeCompositeKey(&end_key_buf, converted_fv, std.math.maxInt(u128));
 
         // Range scan the secondary index
         var iter = try index.tree.rangeScan(start_key, end_key);
@@ -1116,133 +1220,6 @@ pub const Db = struct {
         return result;
     }
 
-    // ===== Transaction Methods =====
-
-    /// Begin a new transaction with the specified isolation level
-    pub fn beginTransaction(self: *Db, isolation_level: IsolationLevel) !*Transaction {
-        return try self.txn_manager.begin(isolation_level);
-    }
-
-    /// Put a key-value pair within a transaction (writes to transaction buffer)
-    pub fn txnPut(self: *Db, txn: *Transaction, key: u128, value: []const u8) !void {
-        _ = self;
-        if (txn.state != .active) {
-            return error.TransactionNotActive;
-        }
-        try txn.addWrite(key, value);
-    }
-
-    /// Get a value within a transaction (respects snapshot isolation)
-    pub fn txnGet(self: *Db, txn: *Transaction, key: u128) ![]const u8 {
-        if (txn.state != .active) {
-            return error.TransactionNotActive;
-        }
-
-        // First check transaction's local write buffer
-        if (txn.getLocalWrite(key)) |value| {
-            if (value.len == 0) {
-                return error.KeyNotFound; // Deleted in this transaction
-            }
-            return value;
-        }
-
-        // Read from database with snapshot isolation
-        if (try self.primary_index.search(key)) |offset| {
-            const metadata = KeyGen.extractMetadata(key);
-            if (self.vlogs.get(metadata.vlog_id)) |vlog| {
-                var vlog_entry = try vlog.get(offset);
-                defer vlog_entry.deinit(self.allocator);
-
-                // Track read for serializable isolation
-                try txn.trackRead(key, txn.id);
-
-                return try self.allocator.dupe(u8, vlog_entry.value);
-            }
-        }
-
-        return error.KeyNotFound;
-    }
-
-    /// Delete a key within a transaction (adds tombstone to transaction buffer)
-    pub fn txnDelete(self: *Db, txn: *Transaction, key: u128) !void {
-        _ = self;
-        if (txn.state != .active) {
-            return error.TransactionNotActive;
-        }
-        try txn.addDelete(key);
-    }
-
-    /// Commit a transaction (applies all writes atomically)
-    pub fn commitTransaction(self: *Db, txn: *Transaction) !void {
-        if (txn.state != .active) {
-            return error.TransactionNotActive;
-        }
-
-        // Mark as preparing
-        txn.state = .preparing;
-
-        // Conflict detection: Check if any keys we're writing have been modified
-        // by other committed transactions since we started
-        for (txn.writes.items) |write| {
-            if (try self.primary_index.search(write.key)) |offset| {
-                const metadata = KeyGen.extractMetadata(write.key);
-                if (self.vlogs.get(metadata.vlog_id)) |vlog| {
-                    var vlog_entry = vlog.get(offset) catch continue;
-                    defer vlog_entry.deinit(self.allocator);
-
-                    // Check if value was modified after our snapshot
-                    if (vlog_entry.timestamp > txn.snapshot_timestamp) {
-                        self.txn_manager.abort(txn);
-                        return error.WriteConflict;
-                    }
-                }
-            }
-        }
-
-        // Apply all writes to the database
-        for (txn.writes.items) |write| {
-            if (write.value.len == 0) {
-                // Deletion
-                try self.del(@bitCast(write.key), write.timestamp);
-            } else {
-                // Put
-                try self.put(@bitCast(write.key), write.value, write.timestamp);
-            }
-        }
-
-        // Flush to ensure durability
-        try self.flush();
-
-        // Commit the transaction
-        try self.txn_manager.commit(txn);
-    }
-
-    /// Abort a transaction (discards all writes)
-    pub fn abortTransaction(self: *Db, txn: *Transaction) void {
-        self.txn_manager.abort(txn);
-    }
-
-    /// Execute a function within a transaction with automatic commit/rollback
-    /// Usage: try db.runInTransaction(.repeatable_read, runMyTransaction, .{&my_context});
-    pub fn runInTransaction(
-        self: *Db,
-        isolation_level: IsolationLevel,
-        comptime func: anytype,
-        args: anytype,
-    ) !void {
-        const txn = try self.beginTransaction(isolation_level);
-        defer txn.deinit();
-
-        // Call the user function with txn prepended to args
-        const full_args = .{ self, txn } ++ args;
-        func(full_args) catch |err| {
-            self.abortTransaction(txn);
-            return err;
-        };
-
-        try self.commitTransaction(txn);
-    }
-
     // ===== Backup/Restore Methods =====
 
     /// Create a full backup of the database
@@ -1327,9 +1304,6 @@ pub const Db = struct {
             }
         }
 
-        // Get active transaction count
-        const active_txns = self.txn_manager.active_txns.count();
-
         return MetricsSnapshot{
             .timestamp = milliTimestamp(),
             .storage = StorageMetrics{
@@ -1347,13 +1321,6 @@ pub const Db = struct {
                 .last_run_duration_ms = self.gc_metrics.last_run_duration_ms.load(.monotonic),
                 .last_run_timestamp = self.gc_metrics.last_run_timestamp.load(.monotonic),
                 .next_run_estimate_ms = 0, // TODO: Calculate based on interval
-            },
-            .transactions = TxnMetricsSnapshot{
-                .active_transactions = @intCast(active_txns),
-                .total_committed = self.metrics_collector.total_txn_commits.load(.monotonic),
-                .total_aborted = self.metrics_collector.total_txn_aborts.load(.monotonic),
-                .total_conflicts = self.metrics_collector.total_txn_conflicts.load(.monotonic),
-                .min_active_txn_id = self.txn_manager.getMinActiveTxn(),
             },
             .performance = self.metrics_collector.getPerformanceMetrics(),
             .vlogs = try self.allocator.dupe(VlogMetrics, vlog_metrics_list.items),

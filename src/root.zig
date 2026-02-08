@@ -49,7 +49,6 @@ test {
     _ = @import("storage/bptree.zig");
     _ = @import("storage/lru_cache.zig");
     _ = @import("storage/db.zig");
-    _ = @import("storage/transaction.zig");
     _ = @import("storage/backup.zig");
     _ = @import("storage/replication.zig");
     _ = @import("storage/security.zig");
