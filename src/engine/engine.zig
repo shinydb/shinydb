@@ -910,7 +910,7 @@ pub const Engine = struct {
             }
         }
 
-        log.info("Query scan: memtable_total={d}, memtable_matched_store={d}, store_id={d}, results_from_memtable={d}", .{ memtable_total, memtable_matched, store_id, count });
+        // log.info("Query scan: memtable_total={d}, memtable_matched_store={d}, store_id={d}, results_from_memtable={d}", .{ memtable_total, memtable_matched, store_id, count });
 
         // Then scan primary index for flushed data
         var index_total: u32 = 0;
@@ -976,7 +976,7 @@ pub const Engine = struct {
                 count += 1;
             }
         }
-        log.info("Index scan: index_total={d}, index_matched_store={d}, final_count={d}", .{ index_total, index_matched, count });
+        // log.info("Index scan: index_total={d}, index_matched_store={d}, final_count={d}", .{ index_total, index_matched, count });
     }
 
     /// Execute an aggregation query on documents in a store
