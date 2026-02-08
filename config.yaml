@@ -1,0 +1,42 @@
+address: "127.0.0.1"
+port: 23469
+max_sessions: 128
+worker_count: 4
+base_dir: /tmp/shinydb/data
+max_cores: 4
+connection_pool:
+  max_queue_size: 1000
+  batch_accept_size: 10
+  connection_timeout_ms: 30000
+  read_timeout_ms: 60000
+  write_timeout_ms: 60000
+  idle_timeout_ms: 300000
+  graceful_shutdown_timeout_ms: 30000
+datafiles:
+  pool_size: 32
+  flush_interval_in_ms: 1000
+buffers:
+  memtable: 16777216
+  vlog: 104857600
+  wal: 1048576
+durability:
+  enabled: true
+  flush_interval_in_ms: 1000
+  group_commit_count: 100
+  group_commit_interval_ms: 10
+file_sizes:
+  vlog: 1073741824
+  wal: 16777216
+paths:
+  vlog: /tmp/shinydb/data/logs
+  wal: /tmp/shinydb/data/wals
+  index: /tmp/shinydb/data/indexes
+index:
+  primary:
+    pool_size: 1024
+  secondary:
+    pool_size: 64
+    max_key_size: 256
+cache:
+  enabled: false
+  capacity: 10000
