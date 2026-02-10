@@ -682,18 +682,23 @@ pub const RangeIterator = struct {
     current_frame: *Frame,
     current_index: u16,
     end_key: ?[]const u8,
+    pinned_page_id: ?PageId, // Track which page is currently pinned to avoid double-unpin
 
     pub fn next(self: *RangeIterator) !?Cell {
         var page = self.current_frame.page.?;
         if (self.current_index >= page.headerPtr().num_cells) {
             // Move to next leaf page
             const next_page_id = page.headerPtr().next_page_id;
-            self.tree.pool.unpinPage(self.current_frame.page_id.?, false);
+            if (self.pinned_page_id) |pid| {
+                self.tree.pool.unpinPage(pid, false);
+                self.pinned_page_id = null;
+            }
 
             if (next_page_id == 0) { // End of list
                 return null;
             }
             self.current_frame = try self.tree.pool.fetchPage(next_page_id);
+            self.pinned_page_id = next_page_id;
             self.current_index = 0;
             page = self.current_frame.page.?;
         }
@@ -712,7 +717,9 @@ pub const RangeIterator = struct {
 
     /// Must be called to release the pinned page.
     pub fn deinit(self: *RangeIterator) void {
-        self.tree.pool.unpinPage(self.current_frame.page_id.?, false);
+        if (self.pinned_page_id) |pid| {
+            self.tree.pool.unpinPage(pid, false);
+        }
     }
 };
 
@@ -857,6 +864,7 @@ const BPlusTree = struct {
             .current_frame = start_frame,
             .current_index = start_index,
             .end_key = end_key,
+            .pinned_page_id = start_frame.page_id.?,
         };
     }
 
@@ -1160,7 +1168,7 @@ pub fn Index(comptime K: type, comptime V: type) type {
 
         pub fn init(allocator: Allocator, config: IndexConfig) !Self {
             const path = try std.fmt.allocPrint(allocator, "{s}/{s}.idx", .{ config.dir_path, config.file_name });
-
+            std.debug.print("Initializing index at path: {s}\n", .{path});
             const pool = try PagePool.init(allocator, config.io, path, config.pool_size);
             return Self{
                 .tree = try BPlusTree.init(pool, allocator),

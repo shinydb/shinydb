@@ -227,7 +227,7 @@ pub const Engine = struct {
             // Duplicate the index_ns since it may be freed by the caller
             const index_ns_owned = try allocator.dupe(u8, index_meta.ns);
             errdefer allocator.free(index_ns_owned);
-
+            
             index_ptr.* = try Index([]const u8, void).init(allocator, .{
                 .dir_path = config.paths.index,
                 .file_name = index_ns_owned,
@@ -756,63 +756,70 @@ pub const Engine = struct {
             }
 
             if (found_index) |index_ns| {
-                // Use index lookup
-                const fv = pred.value;
-                self.db_mutex.lock();
-                var primary_keys = self.db.findBySecondaryIndex(index_ns, fv) catch |err| {
-                    self.db_mutex.unlock();
-                    return err;
-                };
-                defer primary_keys.deinit(self.allocator);
-                self.db_mutex.unlock();
-
-                // Fetch documents and apply remaining filters
-                var skipped: u32 = 0;
-                var count: u32 = 0;
-                for (primary_keys.items) |key| {
-                    if (count >= actual_limit) break;
-
-                    // Fetch document
+                // Only use secondary index for equality predicates
+                // Range queries not yet supported via secondary index (findBySecondaryIndex only does equality lookup)
+                if (pred.operator == .eq) {
+                    // Use index lookup for equality
+                    const fv = pred.value;
                     self.db_mutex.lock();
-                    const value = self.db.get(@bitCast(key)) catch {
+                    var primary_keys = self.db.findBySecondaryIndex(index_ns, fv) catch |err| {
                         self.db_mutex.unlock();
-                        continue;
+                        return err;
                     };
+                    defer primary_keys.deinit(self.allocator);
                     self.db_mutex.unlock();
 
-                    // Apply remaining predicates (in-memory filter)
-                    var matches = true;
-                    for (parsed.predicates.items) |p| {
-                        if (std.mem.eql(u8, p.field_name, pred.field_name)) continue; // Skip index predicate
-                        if (!matchesPredicate(value, p)) {
-                            matches = false;
-                            break;
+                    // Fetch documents and apply remaining filters
+                    var skipped: u32 = 0;
+                    var count: u32 = 0;
+                    for (primary_keys.items) |key| {
+                        if (count >= actual_limit) break;
+
+                        // Fetch document
+                        self.db_mutex.lock();
+                        const value = self.db.get(@bitCast(key)) catch {
+                            self.db_mutex.unlock();
+                            continue;
+                        };
+                        self.db_mutex.unlock();
+
+                        // Apply remaining predicates (in-memory filter)
+                        var matches = true;
+                        for (parsed.predicates.items) |p| {
+                            if (std.mem.eql(u8, p.field_name, pred.field_name)) continue; // Skip equality index predicate (already filtered)
+                            if (!matchesPredicate(value, p)) {
+                                matches = false;
+                                break;
+                            }
                         }
-                    }
 
-                    if (!matches) {
-                        self.allocator.free(value);
-                        continue;
-                    }
+                        if (!matches) {
+                            self.allocator.free(value);
+                            continue;
+                        }
 
-                    // Apply offset
-                    if (skipped < actual_offset) {
-                        skipped += 1;
-                        self.allocator.free(value);
-                        continue;
-                    }
+                        // Apply offset
+                        if (skipped < actual_offset) {
+                            skipped += 1;
+                            self.allocator.free(value);
+                            continue;
+                        }
 
-                    try results.append(self.allocator, Entry{
-                        .key = key,
-                        .ns = "",
-                        .value = value,
-                        .timestamp = milliTimestamp(),
-                        .kind = .read,
-                    });
-                    count += 1;
+                        try results.append(self.allocator, Entry{
+                            .key = key,
+                            .ns = "",
+                            .value = value,
+                            .timestamp = milliTimestamp(),
+                            .kind = .read,
+                        });
+                        count += 1;
+                    }
+                } else {
+                    // Range predicate - fall back to full scan since secondary index only supports equality
+                    try self.fullScanWithFilter(&results, store_id, &parsed, actual_limit, actual_offset);
                 }
             } else {
-                // Fall through to full scan
+                // No matching index - fall back to full scan
                 try self.fullScanWithFilter(&results, store_id, &parsed, actual_limit, actual_offset);
             }
         } else {
@@ -1386,21 +1393,15 @@ fn matchesPredicate(doc_bson: []const u8, pred: query_engine.Predicate) bool {
         if (doc.getField(pred.field_name)) |field_value_opt| {
             if (field_value_opt) |field_value| {
                 // Compare BSON value with predicate value
-                const result = compareBsonValue(field_value, pred.value, pred.operator);
-                std.debug.print("[MATCH] field={s} op={any} bson_val={any} pred_val={any} result={}\n", .{ pred.field_name, pred.operator, field_value, pred.value, result });
-                return result;
-            } else {
-                std.debug.print("[MATCH] field={s} not found in doc\n", .{pred.field_name});
+                return compareBsonValue(field_value, pred.value, pred.operator);
             }
-        } else |err| {
+        } else |_| {
             // Field not found or error reading it
-            std.debug.print("[MATCH] field={s} error: {any}\n", .{ pred.field_name, err });
             return false;
         }
         return false;
-    } else |err| {
+    } else |_| {
         // BSON parsing failed - this shouldn't happen if client sends valid BSON
-        std.debug.print("[MATCH] BSON parse failed: {any}\n", .{err});
         return false;
     }
 }
@@ -1430,14 +1431,21 @@ fn compareBsonValue(bson_val: bson.Value, field_val: FieldValue, op: QueryOperat
             return compareInt64Value(i, field_val, op);
         },
         .double => |d| blk: {
-            if (field_val != .f64_val) break :blk false;
+            const expected: f64 = switch (field_val) {
+                .f64_val => |v| v,
+                .i64_val => |v| @as(f64, @floatFromInt(v)),
+                .i32_val => |v| @as(f64, @floatFromInt(v)),
+                .u64_val => |v| @as(f64, @floatFromInt(v)),
+                .u32_val => |v| @as(f64, @floatFromInt(v)),
+                else => break :blk false,
+            };
             break :blk switch (op) {
-                .eq => d == field_val.f64_val,
-                .ne => d != field_val.f64_val,
-                .gt => d > field_val.f64_val,
-                .gte => d >= field_val.f64_val,
-                .lt => d < field_val.f64_val,
-                .lte => d <= field_val.f64_val,
+                .eq => d == expected,
+                .ne => d != expected,
+                .gt => d > expected,
+                .gte => d >= expected,
+                .lt => d < expected,
+                .lte => d <= expected,
                 else => false,
             };
         },
@@ -1502,6 +1510,18 @@ fn compareInt64Value(i64_val: i64, field_val: FieldValue, op: QueryOperator) boo
                 .gte => u32_val >= expected,
                 .lt => u32_val < expected,
                 .lte => u32_val <= expected,
+                else => false,
+            };
+        },
+        .f64_val => |expected| blk: {
+            const d: f64 = @floatFromInt(i64_val);
+            break :blk switch (op) {
+                .eq => d == expected,
+                .ne => d != expected,
+                .gt => d > expected,
+                .gte => d >= expected,
+                .lt => d < expected,
+                .lte => d <= expected,
                 else => false,
             };
         },

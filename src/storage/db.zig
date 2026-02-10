@@ -646,27 +646,40 @@ pub const Db = struct {
         _ = self;
         var offset: usize = 0;
 
+        // IMPORTANT: Use big-endian encoding for field values to ensure correct
+        // lexicographic sort order in B+ tree for range queries.
+        // For signed integers, XOR with sign bit to map negative values before positive.
+        // For floats, use IEEE 754 sortable encoding (XOR sign bit for positive, all bits for negative).
+        // WARNING: This is a BREAKING CHANGE from previous little-endian encoding.
+        // All existing secondary indexes must be dropped and recreated.
+
         // Write field value
         switch (field_value) {
             .string => |s| {
                 const hash = std.hash.Wyhash.hash(0, s);
-                std.mem.writeInt(u64, buf[offset..][0..8], hash, .little);
+                std.mem.writeInt(u64, buf[offset..][0..8], hash, .big);
                 offset += 8;
             },
             .u64_val => |v| {
-                std.mem.writeInt(u64, buf[offset..][0..8], v, .little);
+                // Unsigned: big-endian directly gives correct sort order
+                std.mem.writeInt(u64, buf[offset..][0..8], v, .big);
                 offset += 8;
             },
             .i64_val => |v| {
-                std.mem.writeInt(i64, buf[offset..][0..8], v, .little);
+                // Signed: XOR with sign bit (0x8000...) to map negatives before positives
+                const biased: u64 = @bitCast(v ^ @as(i64, std.math.minInt(i64)));
+                std.mem.writeInt(u64, buf[offset..][0..8], biased, .big);
                 offset += 8;
             },
             .u32_val => |v| {
-                std.mem.writeInt(u32, buf[offset..][0..4], v, .little);
+                // Unsigned: big-endian directly gives correct sort order
+                std.mem.writeInt(u32, buf[offset..][0..4], v, .big);
                 offset += 4;
             },
             .i32_val => |v| {
-                std.mem.writeInt(i32, buf[offset..][0..4], v, .little);
+                // Signed: XOR with sign bit to map negatives before positives
+                const biased: u32 = @bitCast(v ^ @as(i32, std.math.minInt(i32)));
+                std.mem.writeInt(u32, buf[offset..][0..4], biased, .big);
                 offset += 4;
             },
             .bool_val => |v| {
@@ -674,13 +687,19 @@ pub const Db = struct {
                 offset += 1;
             },
             .f64_val => |v| {
-                std.mem.writeInt(u64, buf[offset..][0..8], @bitCast(v), .little);
+                // IEEE 754 sortable encoding: flip sign bit for positive, all bits for negative
+                const bits: u64 = @bitCast(v);
+                const sortable = if (v >= 0.0)
+                    bits ^ 0x8000000000000000 // Positive: flip sign bit
+                else
+                    ~bits; // Negative: flip all bits
+                std.mem.writeInt(u64, buf[offset..][0..8], sortable, .big);
                 offset += 8;
             },
         }
 
-        // Write primary key
-        std.mem.writeInt(u128, buf[offset..][0..16], primary_key, .little);
+        // Write primary key (unsigned, big-endian for consistent ordering)
+        std.mem.writeInt(u128, buf[offset..][0..16], primary_key, .big);
         offset += 16;
 
         return buf[0..offset];
@@ -1120,10 +1139,10 @@ pub const Db = struct {
 
         while (try iter.next()) |entry| {
             // Extract primary key from the composite key
-            // The primary key is the last 16 bytes of the composite key
+            // The primary key is the last 16 bytes of the composite key (big-endian)
             const key_len = entry.key.len;
             if (key_len >= 16) {
-                const primary_key = std.mem.readInt(u128, entry.key[key_len - 16 ..][0..16], .little);
+                const primary_key = std.mem.readInt(u128, entry.key[key_len - 16 ..][0..16], .big);
                 try result.append(self.allocator, primary_key);
             }
         }
