@@ -9,6 +9,7 @@ pub const Config = struct {
     worker_count: u32,
     base_dir: []const u8,
     max_cores: u8,
+
     connection_pool: struct {
         max_queue_size: u32,
         batch_accept_size: u32,
@@ -17,10 +18,6 @@ pub const Config = struct {
         write_timeout_ms: u64,
         idle_timeout_ms: u64,
         graceful_shutdown_timeout_ms: u64,
-    },
-    datafiles: struct {
-        pool_size: u32,
-        flush_interval_in_ms: u64,
     },
     buffers: struct {
         memtable: usize,

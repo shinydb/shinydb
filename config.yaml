@@ -13,7 +13,7 @@ connection_pool:
   idle_timeout_ms: 300000
   graceful_shutdown_timeout_ms: 30000
 datafiles:
-  pool_size: 32
+  pool_size: 16
   flush_interval_in_ms: 1000
 buffers:
   memtable: 16777216

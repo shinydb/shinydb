@@ -178,11 +178,8 @@ pub const Db = struct {
         var seconds_elapsed: u64 = 0;
 
         while (!db.gc_shutdown.load(.acquire)) {
-            // Sleep in small increments to allow quick shutdown
-            var i: u64 = 0;
-            while (i < 10 and !db.gc_shutdown.load(.acquire)) : (i += 1) {
-                std.Thread.yield() catch {};
-            }
+            // Sleep for 100ms to allow quick shutdown while avoiding busy-waiting
+            std.posix.nanosleep(0, 100_000_000); // 100ms
             seconds_elapsed += 1;
 
             // Check if it's time to run GC

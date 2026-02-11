@@ -4,6 +4,7 @@ const Io = std.Io;
 const Config = @import("common/config.zig").Config;
 const Engine = @import("engine/engine.zig").Engine;
 const Server = @import("tcp/server.zig").Server;
+const SecurityManager = @import("storage/security.zig").SecurityManager;
 const common = @import("common/common.zig");
 
 const log = std.log.scoped(.main);
@@ -112,6 +113,11 @@ pub fn main() !void {
 
     log.info("Starting ShinyDb....", .{});
 
+    // TODO: Make security_enabled configurable via config file
+    const security_enabled = true; // Enable security by default
+
+    log.info("Using std.Io.Threaded server", .{});
+
     // Initialize the database engine
     const engine = Engine.init(allocator, config, io) catch |err| {
         log.err("Failed to initialize engine: {}", .{err});
@@ -120,12 +126,11 @@ pub fn main() !void {
     defer engine.deinit();
 
     // Initialize and run the TCP server
-    // TODO: Make security_enabled configurable via config file
-    const security_enabled = true; // Enable security by default
     var server = Server.init(allocator, config, io, engine, security_enabled) catch |err| {
         log.err("Failed to initialize server: {}", .{err});
         return err;
     };
+    defer server.deinit();
 
     // Run the server (blocking)
     server.run() catch |err| {
