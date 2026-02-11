@@ -42,6 +42,12 @@ pub const Config = struct {
         index: []const u8,
         metadata: []const u8,
     },
+    gc_config: struct {
+        enabled: bool,
+        interval_seconds: u64,  
+        dead_ratio_threshold: f64,  
+        max_concurrent: usize,  
+    },
     index: struct {
         primary: struct {
             pool_size: u32,
@@ -121,10 +127,6 @@ test "Config - nested struct access" {
             .idle_timeout_ms = 60000,
             .graceful_shutdown_timeout_ms = 10000,
         },
-        .datafiles = .{
-            .pool_size = 16,
-            .flush_interval_in_ms = 1000,
-        },
         .buffers = .{
             .memtable = 64 * 1024 * 1024,
             .vlog = 32 * 1024 * 1024,
@@ -142,6 +144,13 @@ test "Config - nested struct access" {
             .vlog = "data/vlog",
             .wal = "data/wal",
             .index = "data/index",
+            .metadata = "data/metadata",
+        },
+        .gc_config = .{
+            .enabled = true,
+            .interval_seconds = 300,
+            .dead_ratio_threshold = 0.5,
+            .max_concurrent = 4,
         },
         .index = .{
             .primary = .{ .pool_size = 32 },
@@ -151,7 +160,6 @@ test "Config - nested struct access" {
 
     try std.testing.expectEqual(@as(u16, 23469), cfg.port);
     try std.testing.expectEqual(@as(u32, 100), cfg.connection_pool.max_queue_size);
-    try std.testing.expectEqual(@as(u32, 16), cfg.datafiles.pool_size);
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), cfg.buffers.memtable);
     try std.testing.expect(cfg.durability.enabled);
     try std.testing.expectEqual(@as(u32, 32), cfg.index.primary.pool_size);

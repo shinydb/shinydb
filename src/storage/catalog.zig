@@ -7,6 +7,7 @@ const Store = proto.Store;
 const Index = proto.Index;
 const User = proto.User;
 const Backup = proto.Backup;
+const VLog = proto.VLog;
 const FieldType = proto.FieldType;
 const bson = @import("bson");
 const Io = std.Io;
@@ -592,6 +593,46 @@ pub const Catalog = struct {
         var encoder = bson.Encoder.init(allocator);
         defer encoder.deinit();
         return try encoder.encode(wrapper);
+    }
+
+    // ========================================================================
+    // VLog operations
+    // ========================================================================
+
+    /// List vlogs as BSON-encoded bytes for protocol replies
+    /// This is used by the replication protocol to get the list of available vlogs and their metadata
+    pub fn listVLogsBson(self: *Catalog, allocator: mem.Allocator) ![]const u8 {
+        var list: std.ArrayList(VLog) = .empty;
+        defer list.deinit(allocator);
+        var iter = self.vlogs.valueIterator();
+        while (iter.next()) |vlog_ptr| {
+            try list.append(allocator, vlog_ptr.*.*);
+        }
+        const wrapper = struct { vlogs: []VLog }{ .vlogs = list.items };
+        var encoder = bson.Encoder.init(allocator);
+        defer encoder.deinit();
+        return try encoder.encode(wrapper);
+    }
+
+    pub fn createVLog(self: *Catalog, id: u16, file_name: []const u8) !*VLog {
+        const vlog = try self.allocator.create(VLog);
+        vlog.* = VLog{
+            .id = id,
+            .file_name = try self.allocator.dupe(u8, file_name),
+            .created_at = milliTimestamp(),
+        };
+        try self.vlogs.put(file_name, vlog);
+        try self.saveMetadata();
+        return vlog;
+    }
+
+    pub fn listVLogs(self: *Catalog, allocator: mem.Allocator) !std.ArrayList(*VLog) {
+        var result: std.ArrayList(*VLog) = .empty;
+        var iter = self.vlogs.iterator();
+        while (iter.next()) |entry| {
+            try result.append(allocator, entry.value_ptr.*);
+        }
+        return result;
     }
 
     // ========================================================================

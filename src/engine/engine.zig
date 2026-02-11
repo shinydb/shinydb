@@ -227,7 +227,7 @@ pub const Engine = struct {
             // Duplicate the index_ns since it may be freed by the caller
             const index_ns_owned = try allocator.dupe(u8, index_meta.ns);
             errdefer allocator.free(index_ns_owned);
-            
+
             index_ptr.* = try Index([]const u8, void).init(allocator, .{
                 .dir_path = config.paths.index,
                 .file_name = index_ns_owned,
@@ -1035,6 +1035,78 @@ pub const Engine = struct {
     /// Returns JSON result with aggregated values, optionally grouped
     /// Scan documents with limit and skip (for YCSB Workload E)
     pub fn scanDocs(self: *Self, start_key: ?u128, limit_count: u32, skip_count: u32) ![]Entry {
+        // First, collect all keys from all data sources in sorted order
+        var all_keys: std.ArrayList(u128) = .empty;
+        defer all_keys.deinit(self.allocator);
+
+        // Track keys we've seen to avoid duplicates
+        var seen_keys = std.AutoHashMap(u128, void).init(self.allocator);
+        defer seen_keys.deinit();
+
+        // Lock the database for iteration
+        self.db_mutex.lock();
+        defer self.db_mutex.unlock();
+
+        // 1. Collect keys from active memtable
+        var active_iter = self.db.memtable.active.iterator();
+        while (active_iter.next()) |entry| {
+            if (entry.kind == .delete) continue;
+
+            const key = entry.key;
+            if (start_key) |sk| {
+                if (key < sk) continue;
+            }
+
+            if (!seen_keys.contains(key)) {
+                try seen_keys.put(key, {});
+                try all_keys.append(self.allocator, key);
+            }
+        }
+
+        // 2. Collect keys from inactive skiplists
+        var inactive_iter = self.db.memtable.lists.iterator();
+        while (inactive_iter.next()) |skiplist| {
+            var list_iter = skiplist.iterator();
+            while (list_iter.next()) |entry| {
+                if (entry.kind == .delete) continue;
+
+                const key = entry.key;
+                if (start_key) |sk| {
+                    if (key < sk) continue;
+                }
+
+                if (!seen_keys.contains(key)) {
+                    try seen_keys.put(key, {});
+                    try all_keys.append(self.allocator, key);
+                }
+            }
+        }
+
+        // 3. Collect keys from B+ tree index
+        {
+            self.primary_index_mutex.lock();
+            defer self.primary_index_mutex.unlock();
+
+            var it = try self.primary_index.iterator();
+            defer it.deinit();
+
+            while (try it.next()) |cell| {
+                const key = std.mem.readInt(u128, cell.key[0..@sizeOf(u128)], .little);
+                if (start_key) |sk| {
+                    if (key < sk) continue;
+                }
+
+                if (!seen_keys.contains(key)) {
+                    try seen_keys.put(key, {});
+                    try all_keys.append(self.allocator, key);
+                }
+            }
+        }
+
+        // Sort keys to ensure consistent ordering
+        std.mem.sort(u128, all_keys.items, {}, std.sort.asc(u128));
+
+        // Apply skip and limit to the sorted keys
         var results: std.ArrayList(Entry) = .empty;
         errdefer {
             for (results.items) |entry| {
@@ -1043,38 +1115,13 @@ pub const Engine = struct {
             results.deinit(self.allocator);
         }
 
-        var skipped: u32 = 0;
-        var count: u32 = 0;
+        const start_idx = skip_count;
+        const end_idx = @min(start_idx + limit_count, all_keys.items.len);
 
-        // Lock the database for iteration
-        self.db_mutex.lock();
-        defer self.db_mutex.unlock();
-
-        // Scan through all keys in sorted order
-        var active_iter = self.db.memtable.active.iterator();
-        while (active_iter.next()) |entry| {
-            if (entry.kind == .delete) continue;
-
-            const key = entry.key;
-
-            // If start_key is provided, skip until we reach it
-            if (start_key) |sk| {
-                if (key < sk) continue;
-            }
-
-            // Apply skip
-            if (skipped < skip_count) {
-                skipped += 1;
-                continue;
-            }
-
-            // Check if we've reached the limit
-            if (count >= limit_count) break;
-
-            // Fetch the document value
+        // Fetch values for the selected keys
+        for (all_keys.items[start_idx..end_idx]) |key| {
             const value = self.db.get(@bitCast(key)) catch continue;
 
-            // Add to results
             try results.append(self.allocator, Entry{
                 .key = key,
                 .ns = "",
@@ -1082,13 +1129,10 @@ pub const Engine = struct {
                 .timestamp = milliTimestamp(),
                 .kind = .read,
             });
-
-            count += 1;
         }
 
         return results.toOwnedSlice(self.allocator);
     }
-
     pub fn aggregateDocs(self: *Self, store_ns: []const u8, query_json: []const u8) ![]u8 {
         const GroupAccumulator = query_engine.GroupAccumulator;
 

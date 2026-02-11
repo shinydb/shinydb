@@ -646,10 +646,14 @@ pub fn parseJsonQuery(allocator: Allocator, json_str: []const u8) !ParsedQuery {
         }
     }
 
-    // Parse offset
+    // Parse offset or skip (both supported for backward compatibility)
     if (root.object.get("offset")) |offset_val| {
         if (offset_val == .integer) {
             query.offset = @intCast(offset_val.integer);
+        }
+    } else if (root.object.get("skip")) |skip_val| {
+        if (skip_val == .integer) {
+            query.offset = @intCast(skip_val.integer);
         }
     }
 

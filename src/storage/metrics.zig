@@ -12,9 +12,6 @@ pub const MetricsSnapshot = struct {
     // GC metrics
     gc: GcMetricsSnapshot,
 
-    // Transaction metrics
-    transactions: TxnMetricsSnapshot,
-
     // Performance metrics
     performance: PerformanceMetrics,
 
@@ -44,13 +41,6 @@ pub const GcMetricsSnapshot = struct {
     next_run_estimate_ms: i64,
 };
 
-pub const TxnMetricsSnapshot = struct {
-    active_transactions: u64,
-    total_committed: u64,
-    total_aborted: u64,
-    total_conflicts: u64,
-    min_active_txn_id: u64,
-};
 
 pub const PerformanceMetrics = struct {
     ops_per_second: f64,

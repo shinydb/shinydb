@@ -13,8 +13,6 @@ const StorageMetrics = @import("metrics.zig").StorageMetrics;
 const GcMetricsSnapshot = @import("metrics.zig").GcMetricsSnapshot;
 const TxnMetricsSnapshot = @import("metrics.zig").TxnMetricsSnapshot;
 const VlogMetrics = @import("metrics.zig").VlogMetrics;
-const Compressor = @import("compression.zig").Compressor;
-const CompressionConfig = @import("compression.zig").CompressionConfig;
 const WriteAheadLog = @import("../durability/write_ahead_log.zig").WriteAheadLog;
 const WalConfig = @import("../durability/write_ahead_log.zig").WalConfig;
 const LogRecord = @import("../common/common.zig").LogRecord;
@@ -26,7 +24,7 @@ const Entry = common.Entry;
 const CurrentVlog = common.CurrentVlog;
 const milliTimestamp = common.milliTimestamp;
 const Config = @import("../common/config.zig").Config;
-const IndexEntry = @import("../common/common.zig").IndexEntry;
+// const IndexEntry = @import("../common/common.zig").IndexEntry;
 const StoreMetrics = @import("../common/stopwatch.zig").StoreMetrics;
 const KeyGen = @import("../common/keygen.zig").KeyGen;
 const Index = @import("bptree.zig").Index;
@@ -36,48 +34,15 @@ const Catalog = @import("catalog.zig").Catalog;
 const FieldExtractor = @import("field_extractor.zig").FieldExtractor;
 const FieldValue = @import("field_extractor.zig").FieldValue;
 const proto = @import("proto");
+const GarbageCollector = @import("gc.zig").GarbageCollector;
 
 const log = std.log.scoped(.db);
-
-pub const VLogStats = struct {
-    total_bytes: u64,
-    live_bytes: u64,
-    dead_bytes: u64,
-    count: u64,
-    deleted: u64,
-    last_gc_ts: i64,
-
-    pub fn deadRatio(self: *const VLogStats) f64 {
-        if (self.total_bytes == 0) return 0.0;
-        return @as(f64, @floatFromInt(self.dead_bytes)) /
-            @as(f64, @floatFromInt(self.total_bytes));
-    }
-
-    pub fn isGcCandidate(self: *const VLogStats, threshold: f64) bool {
-        return self.deadRatio() >= threshold;
-    }
-};
-
-pub const GcConfig = struct {
-    enabled: bool = true,
-    interval_seconds: u64 = 300, // 5 minutes
-    dead_ratio_threshold: f64 = 0.5, // 50% dead space
-    max_concurrent: usize = 1, // One vlog at a time
-};
-
-pub const GcMetrics = struct {
-    total_runs: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    total_bytes_reclaimed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    last_run_duration_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    last_run_timestamp: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
-};
 
 pub const Db = struct {
     allocator: Allocator,
     io: Io,
     memtable: *MemTable,
     vlogs: std.HashMap(u16, *ValueLog, std.hash_map.AutoContext(u16), std.hash_map.default_max_load_percentage),
-    vlog_stats: std.AutoHashMap(u16, VLogStats),
     current_vlog: CurrentVlog,
     head_vlog_id: u16, // oldest vlog (GC candidate)
     tail_vlog_id: u16, // newest vlog (current writes)
@@ -89,15 +54,10 @@ pub const Db = struct {
     metrics: StoreMetrics = StoreMetrics{},
     count: usize = 0,
     // Background GC
-    gc_config: GcConfig,
-    gc_metrics: GcMetrics,
-    gc_thread: ?std.Thread = null,
-    gc_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    gc: *GarbageCollector,
 
     // Metrics Collector
     metrics_collector: *MetricsCollector,
-    // Compressor
-    compressor: *Compressor,
     // Write-Ahead Log for crash recovery
     wal: *WriteAheadLog,
 
@@ -109,7 +69,6 @@ pub const Db = struct {
 
         const catalog = try Catalog.init(allocator, config.paths.metadata, io);
         const metrics_collector = try MetricsCollector.init(allocator);
-        const compressor = try Compressor.init(allocator, CompressionConfig{});
 
         // Initialize Write-Ahead Log
         const wal = try WriteAheadLog.init(allocator, WalConfig{
@@ -125,7 +84,6 @@ pub const Db = struct {
             .io = io,
             .memtable = try MemTable.init(allocator, config.buffers.memtable),
             .vlogs = std.HashMap(u16, *ValueLog, std.hash_map.AutoContext(u16), std.hash_map.default_max_load_percentage).init(allocator),
-            .vlog_stats = std.AutoHashMap(u16, VLogStats).init(allocator),
             .config = config,
             .primary_index = primary_index,
             .catalog = catalog,
@@ -133,17 +91,15 @@ pub const Db = struct {
             .current_vlog = CurrentVlog{ .id = 0, .offset = 0 },
             .head_vlog_id = 0,
             .tail_vlog_id = 0,
-            .gc_config = GcConfig{},
-            .gc_metrics = GcMetrics{},
+            .gc = undefined, // Will be initialized after load_vlogs
             .metrics_collector = metrics_collector,
-            .compressor = compressor,
             .wal = wal,
         };
 
         try db.load_vlogs();
 
-        // Initialize system_store_key for bootstrap recovery
-        try db.initSystemStoreKey();
+        // Initialize GarbageCollector after vlogs are loaded
+        db.gc = try GarbageCollector.init(allocator, config, &db.vlogs, primary_index, &db.secondary_indexes, &db.tail_vlog_id, wal, io);
 
         // Crash Recovery: Replay WAL logs
         const replay_result = try wal.replay();
@@ -165,84 +121,17 @@ pub const Db = struct {
             }
         }
 
-        // Start background GC thread if enabled
-        if (db.gc_config.enabled) {
-            db.gc_thread = try std.Thread.spawn(.{}, backgroundGcWorker, .{db});
-        }
-
         return db;
     }
 
-    /// Background GC worker thread
-    fn backgroundGcWorker(db: *Db) void {
-        var seconds_elapsed: u64 = 0;
-
-        while (!db.gc_shutdown.load(.acquire)) {
-            // Sleep for 100ms to allow quick shutdown while avoiding busy-waiting
-            std.posix.nanosleep(0, 100_000_000); // 100ms
-            seconds_elapsed += 1;
-
-            // Check if it's time to run GC
-            if (seconds_elapsed < db.gc_config.interval_seconds) continue;
-            seconds_elapsed = 0;
-
-            // Check if shutdown was requested
-            if (db.gc_shutdown.load(.acquire)) break;
-
-            // Run GC cycle
-            const start_time = milliTimestamp();
-            var bytes_reclaimed: u64 = 0;
-
-            // Select GC candidates
-            var candidates = db.selectGcCandidates(db.gc_config.dead_ratio_threshold) catch {
-                continue;
-            };
-            defer candidates.deinit(db.allocator);
-
-            if (candidates.items.len == 0) {
-                // std.debug.print("GC: No candidates found\n", .{});
-                continue;
-            }
-
-            // GC up to max_concurrent vlogs
-            const to_gc = @min(candidates.items.len, db.gc_config.max_concurrent);
-            for (candidates.items[0..to_gc]) |vlog_id| {
-                _ = db.garbageCollectVlog(vlog_id) catch {
-                    continue;
-                };
-
-                // Estimate bytes reclaimed (approximate)
-                if (db.vlog_stats.get(vlog_id)) |stats| {
-                    bytes_reclaimed += stats.dead_bytes;
-                }
-            }
-
-            // Compact primary index to remove tombstones
-            _ = db.compactPrimaryIndex() catch {};
-
-            // Update metrics
-            const duration = milliTimestamp() - start_time;
-            _ = db.gc_metrics.total_runs.fetchAdd(1, .release);
-            _ = db.gc_metrics.total_bytes_reclaimed.fetchAdd(bytes_reclaimed, .release);
-            db.gc_metrics.last_run_duration_ms.store(@intCast(duration), .release);
-            db.gc_metrics.last_run_timestamp.store(start_time, .release);
-        }
-    }
-
     pub fn deinit(self: *Db) void {
-        // Shutdown GC thread
-        if (self.gc_thread) |thread| {
-            self.gc_shutdown.store(true, .release);
-            thread.join();
-        }
+        // Shutdown GC
+        self.gc.deinit();
 
         var vlog_iter = self.vlogs.iterator();
         while (vlog_iter.next()) |vlog| {
             vlog.value_ptr.*.deinit() catch {};
         }
-
-        // Cleanup vlog stats
-        self.vlog_stats.deinit();
 
         // Cleanup secondary indexes
         var idx_iter = self.secondary_indexes.iterator();
@@ -256,77 +145,74 @@ pub const Db = struct {
 
         self.catalog.deinit();
         self.metrics_collector.deinit();
-        self.compressor.deinit();
         self.wal.deinit() catch {};
         self.allocator.destroy(self.config);
         self.allocator.destroy(self);
     }
 
     fn load_vlogs(self: *Db) !void {
-        const files = try sortedFiles(self.allocator, self.config.paths.vlog, self.io);
-        defer {
-            // Free the files array to prevent memory leak
-            for (files) |file_info| {
-                self.allocator.free(file_info.name);
+        // Open the vlog directory for iteration
+        const vlog_dir = try Dir.openDir(.cwd(), self.io, self.config.paths.vlog, .{ .iterate = true });
+        defer vlog_dir.close(self.io);
+
+        var min_id: u16 = std.math.maxInt(u16);
+        var max_id: u16 = 0;
+        var files_found: bool = false;
+
+        // Iterate through directory and process .vlog files directly
+        var iter = vlog_dir.iterate();
+        while (try iter.next(self.io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".vlog")) continue;
+
+            files_found = true;
+
+            var buf: [512]u8 = undefined;
+            const vlog_file_path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ self.config.paths.vlog, entry.name });
+
+            // Create ValueLog instance - the ID will be read from the header during init
+            const vlog = try ValueLog.init(self.allocator, .{
+                .id = 0, // Placeholder - actual ID comes from header
+                .file_name = vlog_file_path,
+                .max_file_size = self.config.file_sizes.vlog,
+                .block_size = self.config.buffers.vlog,
+                .io = self.io,
+            });
+
+            // Get the actual vlog_id from the header (authoritative source)
+            const vlog_id = vlog.header.id;
+            try self.vlogs.put(vlog_id, vlog);
+
+            // Track min and max IDs for head/tail determination
+            if (vlog_id < min_id) min_id = vlog_id;
+            if (vlog_id > max_id) max_id = vlog_id;
+
+            // Initialize byte tracking in header if not set (backward compatibility)
+            if (vlog.header.total_bytes == 0) {
+                vlog.header.total_bytes = vlog.offset;
+                vlog.header.live_bytes = vlog.offset;
+                vlog.header.dead_bytes = 0;
             }
-            self.allocator.free(files);
         }
 
-        if (files.len == 0) {
-            // No vlogs found, create the first one
+        if (!files_found) {
+            // No vlogs found, create the first one (ID 0)
             var buf: [256]u8 = undefined;
             const vlog_file_name = try std.fmt.bufPrint(&buf, "{s}/{d}.vlog", .{ self.config.paths.vlog, 0 });
-            const meta_vlog = try ValueLog.init(self.allocator, .{
+            const vlog = try ValueLog.init(self.allocator, .{
+                .id = 0,
                 .file_name = vlog_file_name,
                 .max_file_size = self.config.file_sizes.vlog,
                 .block_size = self.config.buffers.vlog,
                 .io = self.io,
             });
-            try self.vlogs.put(@as(u16, @intCast(0)), meta_vlog);
-
-            // Initialize stats for new vlog
-            try self.vlog_stats.put(0, VLogStats{
-                .total_bytes = 0,
-                .live_bytes = 0,
-                .dead_bytes = 0,
-                .count = meta_vlog.header.count,
-                .deleted = meta_vlog.header.deleted,
-                .last_gc_ts = meta_vlog.header.last_gc_ts,
-            });
+            try self.vlogs.put(0, vlog);
 
             self.head_vlog_id = 0;
             self.tail_vlog_id = 0;
         } else {
-            // Load existing vlogs and their statistics
-            for (0..files.len) |i| {
-                var buf: [256]u8 = undefined;
-                const vlog_file_name = try std.fmt.bufPrint(&buf, "{s}/{d}.vlog", .{ self.config.paths.vlog, i });
-                const vlog = try ValueLog.init(self.allocator, .{
-                    .file_name = vlog_file_name,
-                    .max_file_size = self.config.file_sizes.vlog,
-                    .block_size = self.config.buffers.vlog,
-                    .io = self.io,
-                });
-                const vlog_id = @as(u16, @intCast(i));
-                try self.vlogs.put(vlog_id, vlog);
-
-                // Initialize stats from vlog header
-                // Note: total_bytes and live_bytes will be calculated during first GC scan
-                // For now, use approximate values based on file size
-                const file_size = vlog.offset; // Current file size
-                try self.vlog_stats.put(vlog_id, VLogStats{
-                    .total_bytes = file_size,
-                    .live_bytes = file_size, // Assume all live initially; GC will update
-                    .dead_bytes = 0,
-                    .count = vlog.header.count,
-                    .deleted = vlog.header.deleted,
-                    .last_gc_ts = vlog.header.last_gc_ts,
-                });
-            }
-
-            // Set head (oldest) and tail (newest) vlog IDs
-            self.head_vlog_id = 0; // Oldest vlog (GC candidate)
-            self.tail_vlog_id = @as(u16, @intCast(self.vlogs.count() - 1)); // Newest vlog
+            self.head_vlog_id = min_id;
+            self.tail_vlog_id = max_id;
         }
 
         // Set current_vlog to tail (newest)
@@ -334,45 +220,6 @@ pub const Db = struct {
         if (self.vlogs.get(self.current_vlog.id)) |vlog| {
             self.current_vlog.offset = vlog.offset;
         }
-    }
-
-    fn initSystemStoreKey(self: *Db) !void {
-        // Check if system_store_key exists in any vlog header
-        var iter = self.vlogs.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.*.header.system_store_key_exists) {
-                self.system_store_key = entry.value_ptr.*.header.system_store_key;
-                log.info("Loaded system_store_key from vlog {d}: {d}", .{ entry.key_ptr.*, self.system_store_key });
-                return;
-            }
-        }
-
-        // If no system_store_key found, generate a new one
-        var keygen = KeyGen.init();
-        self.system_store_key = try keygen.Gen(0, 0, 1); // store_id=0, doc_type=1 for primary index
-        log.info("Generated new system_store_key: {d}", .{self.system_store_key});
-
-        // Update all vlog headers with the new system_store_key
-        var vlog_iter = self.vlogs.iterator();
-        while (vlog_iter.next()) |entry| {
-            entry.value_ptr.*.header.system_store_key_exists = true;
-            entry.value_ptr.*.header.system_store_key = self.system_store_key;
-
-            // Serialize and write updated header to file
-            var header_buf: [46]u8 = undefined;
-            std.mem.writeInt(u32, header_buf[0..4], entry.value_ptr.*.header.magic, .little);
-            header_buf[4] = entry.value_ptr.*.header.version;
-            std.mem.writeInt(u64, header_buf[5..13], entry.value_ptr.*.header.count, .little);
-            std.mem.writeInt(u64, header_buf[13..21], entry.value_ptr.*.header.deleted, .little);
-            std.mem.writeInt(i64, header_buf[21..29], entry.value_ptr.*.header.last_gc_ts, .little);
-            header_buf[29] = if (entry.value_ptr.*.header.system_store_key_exists) 1 else 0;
-            std.mem.writeInt(u128, header_buf[30..46], entry.value_ptr.*.header.system_store_key, .little);
-
-            try entry.value_ptr.*.file.writePositionalAll(self.io, &header_buf, 0);
-            try entry.value_ptr.*.file.sync(self.io);
-        }
-
-        log.info("Updated all vlog headers with system_store_key", .{});
     }
 
     pub fn post(self: *Db, entry: Entry) !void {
@@ -411,6 +258,12 @@ pub const Db = struct {
                     if (self.vlogs.get(metadata.vlog_id)) |vlog| {
                         var vlog_entry = try vlog.get(offset);
                         defer vlog_entry.deinit(self.allocator);
+
+                        // Check if this is a tombstone (deleted entry)
+                        if (vlog_entry.tombstone) {
+                            return error.NotFound;
+                        }
+
                         return try self.allocator.dupe(u8, vlog_entry.value);
                     }
                 }
@@ -427,13 +280,61 @@ pub const Db = struct {
         return error.NotFound;
     }
 
-    pub fn del(self: *Db, key: i128, _: i64) !void {
+    pub fn del(self: *Db, key: i128, timestamp: i64) !void {
         // NOTE: WAL write is handled by Engine layer with group commits
         // Do not write to WAL here to avoid double-writing
-        // timestamp parameter kept for API compatibility
 
-        // Delete from memtable
-        return try self.memtable.del(key);
+        // First, mark as deleted in memtable
+        _ = self.memtable.del(key) catch |e| {
+            if (e == error.NotFound) {
+                // Not found in memtable - check if it exists in vlog
+                const key_u128: u128 = @bitCast(key);
+                if (try self.primary_index.search(key_u128)) |old_offset| {
+                    // Key exists in vlog - need to write tombstone immediately
+                    const metadata = KeyGen.extractMetadata(key_u128);
+                    if (self.vlogs.get(metadata.vlog_id)) |vlog| {
+                        // Read the old value to get it for secondary index removal
+                        var old_entry = try vlog.get(old_offset);
+                        defer old_entry.deinit(self.allocator);
+
+                        // Mark old value as dead in stats
+                        try self.gc.markValueAsDead(vlog, old_offset);
+
+                        // Get the current vlog for writing the tombstone
+                        const current_vlog_id = self.current_vlog.id;
+                        if (self.vlogs.get(current_vlog_id)) |current_vlog| {
+                            // Write tombstone to current vlog
+                            const tombstone = VlogEntry{
+                                .key = key_u128,
+                                .value = &[_]u8{}, // Empty value
+                                .timestamp = timestamp,
+                                .tombstone = true, // Explicit tombstone marker
+                            };
+                            const new_offset = try current_vlog.put(tombstone);
+
+                            // Increment deleted counter in vlog header
+                            try current_vlog.incrementDeleted();
+
+                            // Update vlog stats in memory
+                            try self.updateVlogStats(current_vlog, tombstone.size(), true);
+
+                            // Update primary index with tombstone offset
+                            try self.primary_index.insert(key_u128, new_offset);
+
+                            // Remove from secondary indexes using old value
+                            try self.removeFromSecondaryIndexes(key_u128, old_entry.value);
+
+                            // Flush to ensure durability
+                            try current_vlog.flush();
+                            try self.primary_index.flush();
+                        }
+                    }
+                }
+                // If not found anywhere, silently succeed (idempotent delete)
+                return;
+            }
+            return e;
+        };
     }
 
     pub fn shutdown(self: *Db) !void {
@@ -547,6 +448,9 @@ pub const Db = struct {
                             // Read the document from vlog
                             var vlog_entry = vlog.get(offset) catch continue;
                             defer vlog_entry.deinit(self.allocator);
+
+                            // Skip tombstones (deleted entries)
+                            if (vlog_entry.tombstone) continue;
 
                             // Extract field value from the document
                             const field_value = try extractor.extract(vlog_entry.value, field_name, field_type);
@@ -744,223 +648,17 @@ pub const Db = struct {
     }
 
     /// Update vlog statistics after a write
-    fn updateVlogStats(self: *Db, vlog_id: u16, bytes_written: u64, is_delete: bool) !void {
-        if (self.vlog_stats.getPtr(vlog_id)) |stats| {
-            stats.total_bytes += bytes_written;
-            stats.live_bytes += bytes_written;
-            stats.count += 1;
-            if (is_delete) {
-                stats.deleted += 1;
-            }
+    fn updateVlogStats(self: *Db, vlog: *ValueLog, bytes_written: u64, is_delete: bool) !void {
+        _ = self;
+        vlog.header.total_bytes += bytes_written;
+        vlog.header.live_bytes += bytes_written;
+        vlog.header.count += 1;
+        if (is_delete) {
+            vlog.header.deleted += 1;
         }
     }
 
     /// Mark old value as dead in vlog statistics (called on update/delete)
-    fn markValueAsDead(self: *Db, key: u128, old_offset: u64) !void {
-        const metadata = KeyGen.extractMetadata(key);
-        const vlog_id = metadata.vlog_id;
-
-        if (self.vlog_stats.getPtr(vlog_id)) |stats| {
-            // Read old entry to get its size
-            if (self.vlogs.get(vlog_id)) |vlog| {
-                var old_entry = vlog.get(old_offset) catch return;
-                defer old_entry.deinit(self.allocator);
-
-                const old_size = old_entry.size();
-                if (stats.live_bytes >= old_size) {
-                    stats.live_bytes -= old_size;
-                    stats.dead_bytes += old_size;
-                }
-            }
-        }
-    }
-
-    /// Compact primary index by removing tombstones (deleted entries)
-    /// This reclaims space in the B+ tree and improves lookup performance
-    pub fn compactPrimaryIndex(self: *Db) !usize {
-        var removed_count: usize = 0;
-        var keys_to_delete: std.ArrayList(u128) = .empty;
-        defer keys_to_delete.deinit(self.allocator);
-
-        // Phase 1: Scan index and identify tombstones
-        var iter = try self.primary_index.iterator();
-        defer iter.deinit();
-
-        while (try iter.next()) |cell| {
-            // Parse key from cell
-            if (cell.key.len >= 16) {
-                const key = std.mem.readInt(u128, cell.key[0..16], .big);
-
-                // Parse offset from cell value
-                if (cell.value.len >= 8) {
-                    const offset = std.mem.readInt(u64, cell.value[0..8], .little);
-
-                    // Extract vlog_id from key
-                    const metadata = KeyGen.extractMetadata(key);
-
-                    // Check if this points to a tombstone
-                    if (self.vlogs.get(metadata.vlog_id)) |vlog| {
-                        var vlog_entry = vlog.get(offset) catch continue;
-                        defer vlog_entry.deinit(self.allocator);
-
-                        // If value is empty, it's a tombstone
-                        if (vlog_entry.value.len == 0) {
-                            try keys_to_delete.append(self.allocator, key);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 2: Delete tombstone entries from index
-        for (keys_to_delete.items) |key| {
-            try self.primary_index.delete(key);
-            removed_count += 1;
-        }
-
-        return removed_count;
-    }
-
-    /// Select vlog candidates for garbage collection
-    /// Returns vlog IDs that exceed the dead ratio threshold
-    pub fn selectGcCandidates(self: *Db, dead_ratio_threshold: f64) !std.ArrayList(u16) {
-        var candidates: std.ArrayList(u16) = .empty;
-
-        var iter = self.vlog_stats.iterator();
-        while (iter.next()) |entry| {
-            const vlog_id = entry.key_ptr.*;
-            const stats = entry.value_ptr.*;
-
-            // Don't GC the current active vlog (tail)
-            if (vlog_id == self.tail_vlog_id) continue;
-
-            // Check if this vlog is a GC candidate
-            if (stats.isGcCandidate(dead_ratio_threshold)) {
-                try candidates.append(self.allocator, vlog_id);
-            }
-        }
-
-        // Sort by dead ratio (highest first) for prioritization
-        std.mem.sort(u16, candidates.items, self, struct {
-            fn compare(db: *Db, a: u16, b: u16) bool {
-                const stats_a = db.vlog_stats.get(a) orelse return false;
-                const stats_b = db.vlog_stats.get(b) orelse return false;
-                return stats_a.deadRatio() > stats_b.deadRatio();
-            }
-        }.compare);
-
-        return candidates;
-    }
-
-    /// Garbage collect a vlog file by copying live values to a new file
-    /// Returns the number of entries compacted
-    pub fn garbageCollectVlog(self: *Db, vlog_id: u16) !usize {
-        const old_vlog = self.vlogs.get(vlog_id) orelse return error.VlogNotFound;
-        var stats = self.vlog_stats.getPtr(vlog_id) orelse return error.StatsNotFound;
-
-        // Create temp vlog for compacted data
-        var buf: [256]u8 = undefined;
-        const temp_vlog_name = try std.fmt.bufPrint(&buf, "{s}/{d}.vlog.tmp", .{ self.config.paths.vlog, vlog_id });
-        const temp_vlog = try ValueLog.init(self.allocator, .{
-            .file_name = temp_vlog_name,
-            .max_file_size = self.config.file_sizes.vlog,
-            .block_size = self.config.buffers.vlog,
-            .io = self.io,
-        });
-        defer temp_vlog.deinit() catch {};
-
-        // Track updates for batch index update
-        const IndexUpdate = struct { key: u128, new_offset: u64 };
-        var index_updates: std.ArrayList(IndexUpdate) = .empty;
-        defer index_updates.deinit(self.allocator);
-
-        var live_entries: usize = 0;
-        var dead_entries: usize = 0;
-
-        // Phase 1: Scan primary index to find live entries in this vlog
-        var iter = try self.primary_index.iterator();
-        defer iter.deinit();
-
-        while (try iter.next()) |cell| {
-            if (cell.key.len >= 16 and cell.value.len >= 8) {
-                const key = std.mem.readInt(u128, cell.key[0..16], .big);
-                const old_offset = std.mem.readInt(u64, cell.value[0..8], .little);
-
-                const metadata = KeyGen.extractMetadata(key);
-
-                // Only process entries from the target vlog
-                if (metadata.vlog_id != vlog_id) continue;
-
-                // Read entry from old vlog
-                var vlog_entry = old_vlog.get(old_offset) catch {
-                    dead_entries += 1;
-                    continue;
-                };
-                defer vlog_entry.deinit(self.allocator);
-
-                // Skip tombstones (empty values)
-                if (vlog_entry.value.len == 0) {
-                    dead_entries += 1;
-                    continue;
-                }
-
-                // Copy live entry to temp vlog
-                const new_offset = try temp_vlog.put(vlog_entry);
-                try index_updates.append(self.allocator, .{ .key = key, .new_offset = new_offset });
-                live_entries += 1;
-            }
-        }
-
-        // Flush temp vlog
-        try temp_vlog.flush();
-
-        // Phase 2: Batch update primary index with new offsets
-        for (index_updates.items) |update| {
-            try self.primary_index.insert(update.key, update.new_offset);
-        }
-
-        // Phase 3: Swap files atomically
-        const old_vlog_name = try std.fmt.bufPrint(&buf, "{s}/{d}.vlog", .{ self.config.paths.vlog, vlog_id });
-        const backup_name = try std.fmt.bufPrint(&buf, "{s}/{d}.vlog.old", .{ self.config.paths.vlog, vlog_id });
-
-        // Close old vlog before file operations
-        try old_vlog.deinit();
-
-        // Rename old vlog to backup
-        Dir.rename(.cwd(), old_vlog_name, .cwd(), backup_name, self.io) catch |err| {
-            return err;
-        };
-
-        // Rename temp to actual vlog
-        Dir.rename(.cwd(), temp_vlog_name, .cwd(), old_vlog_name, self.io) catch |err| {
-            // Try to restore backup
-            Dir.rename(.cwd(), backup_name, .cwd(), old_vlog_name, self.io) catch {};
-            return err;
-        };
-
-        // Delete backup
-        Dir.deleteFile(.cwd(), self.io, backup_name) catch {};
-
-        // Reopen the compacted vlog
-        const new_vlog = try ValueLog.init(self.allocator, .{
-            .file_name = old_vlog_name,
-            .max_file_size = self.config.file_sizes.vlog,
-            .block_size = self.config.buffers.vlog,
-            .io = self.io,
-        });
-        try self.vlogs.put(vlog_id, new_vlog);
-
-        // Update stats
-        stats.total_bytes = new_vlog.offset;
-        stats.live_bytes = new_vlog.offset;
-        stats.dead_bytes = 0;
-        stats.count = live_entries;
-        stats.deleted = 0;
-        stats.last_gc_ts = milliTimestamp();
-
-        return dead_entries;
-    }
-
     /// Check if vlog rotation is needed and perform it
     fn maybeRotateVlog(self: *Db) !void {
         if (self.vlogs.get(self.current_vlog.id)) |current_vlog| {
@@ -974,6 +672,7 @@ pub const Db = struct {
                 var buf: [256]u8 = undefined;
                 const vlog_file_name = try std.fmt.bufPrint(&buf, "{s}/{d}.vlog", .{ self.config.paths.vlog, new_vlog_id });
                 const new_vlog = try ValueLog.init(self.allocator, .{
+                    .id = new_vlog_id,
                     .file_name = vlog_file_name,
                     .max_file_size = self.config.file_sizes.vlog,
                     .block_size = self.config.buffers.vlog,
@@ -982,16 +681,6 @@ pub const Db = struct {
 
                 // Add new vlog to HashMap
                 try self.vlogs.put(new_vlog_id, new_vlog);
-
-                // Initialize stats for new vlog
-                try self.vlog_stats.put(new_vlog_id, VLogStats{
-                    .total_bytes = 0,
-                    .live_bytes = 0,
-                    .dead_bytes = 0,
-                    .count = 0,
-                    .deleted = 0,
-                    .last_gc_ts = 0,
-                });
 
                 // Update tail and current vlog
                 self.tail_vlog_id = new_vlog_id;
@@ -1033,7 +722,7 @@ pub const Db = struct {
                 if (self.vlogs.get(vlog_id)) |vlog| {
                     // Check if key already exists and mark old value as dead
                     if (try self.primary_index.search(entry.key)) |old_offset| {
-                        try self.markValueAsDead(entry.key, old_offset);
+                        try self.gc.markValueAsDead(vlog, old_offset);
                     }
 
                     if (entry.kind == .delete) {
@@ -1042,14 +731,18 @@ pub const Db = struct {
                         self.metrics.vlog_writes.start();
                         const vlog_entry = VlogEntry{
                             .key = entry.key,
-                            .value = &[_]u8{}, // Empty value for tombstone
+                            .value = &[_]u8{}, // Empty value
                             .timestamp = entry.timestamp,
+                            .tombstone = true, // Explicit tombstone marker
                         };
                         const offset = try vlog.put(vlog_entry);
                         self.metrics.vlog_writes.stop();
 
-                        // Update vlog stats
-                        try self.updateVlogStats(vlog_id, vlog_entry.size(), true);
+                        // Increment deleted counter in vlog header
+                        try vlog.incrementDeleted();
+
+                        // Update vlog stats in memory
+                        try self.updateVlogStats(vlog, vlog_entry.size(), true);
 
                         // Update primary index with tombstone offset
                         try self.primary_index.insert(entry.key, offset);
@@ -1068,7 +761,7 @@ pub const Db = struct {
                         self.metrics.vlog_writes.stop();
 
                         // Update vlog stats
-                        try self.updateVlogStats(vlog_id, vlog_entry.size(), false);
+                        try self.updateVlogStats(vlog, vlog_entry.size(), false);
 
                         // Update primary index with actual offset from vlog
                         try self.primary_index.insert(entry.key, offset);
@@ -1088,6 +781,13 @@ pub const Db = struct {
             while (vlog_iter.next()) |vlog| {
                 try vlog.value_ptr.*.flush();
             }
+
+            // Sync all vlog headers to persist statistics (count, deleted, byte tracking)
+            var header_sync_iter = self.vlogs.iterator();
+            while (header_sync_iter.next()) |vlog| {
+                try vlog.value_ptr.*.syncHeader();
+            }
+            log.info("All vlog headers synced to disk", .{});
 
             // Flush primary index to disk to ensure durability
             try self.primary_index.flush();
@@ -1220,6 +920,9 @@ pub const Db = struct {
                     };
                     defer vlog_entry.deinit(self.allocator);
 
+                    // Skip tombstones (deleted entries)
+                    if (vlog_entry.tombstone) continue;
+
                     // Allocate and copy the value so it persists
                     const value_copy = try self.allocator.dupe(u8, vlog_entry.value);
                     try result.append(self.allocator, value_copy);
@@ -1303,22 +1006,23 @@ pub const Db = struct {
         var vlog_iter = self.vlogs.iterator();
         while (vlog_iter.next()) |entry| {
             const vlog_id = entry.key_ptr.*;
+            const vlog = entry.value_ptr.*;
 
-            if (self.vlog_stats.get(vlog_id)) |stats| {
-                total_vlog_size += stats.total_bytes;
+            total_vlog_size += vlog.header.total_bytes;
 
-                try vlog_metrics_list.append(self.allocator, VlogMetrics{
-                    .vlog_id = vlog_id,
-                    .total_bytes = stats.total_bytes,
-                    .live_bytes = stats.live_bytes,
-                    .dead_bytes = stats.dead_bytes,
-                    .dead_ratio = stats.deadRatio(),
-                    .entry_count = stats.count,
-                    .deleted_count = stats.deleted,
-                    .last_gc_timestamp = stats.last_gc_ts,
-                });
-            }
+            try vlog_metrics_list.append(self.allocator, VlogMetrics{
+                .vlog_id = vlog_id,
+                .total_bytes = vlog.header.total_bytes,
+                .live_bytes = vlog.header.live_bytes,
+                .dead_bytes = vlog.header.dead_bytes,
+                .dead_ratio = vlog.header.deadRatio(),
+                .entry_count = vlog.header.count,
+                .deleted_count = vlog.header.deleted,
+                .last_gc_timestamp = vlog.header.last_gc_ts,
+            });
         }
+
+        const gc_metrics = self.gc.getMetrics();
 
         return MetricsSnapshot{
             .timestamp = milliTimestamp(),
@@ -1331,11 +1035,11 @@ pub const Db = struct {
                 .vlog_size_bytes = total_vlog_size,
             },
             .gc = GcMetricsSnapshot{
-                .enabled = self.gc_config.enabled,
-                .total_runs = self.gc_metrics.total_runs.load(.monotonic),
-                .total_bytes_reclaimed = self.gc_metrics.total_bytes_reclaimed.load(.monotonic),
-                .last_run_duration_ms = self.gc_metrics.last_run_duration_ms.load(.monotonic),
-                .last_run_timestamp = self.gc_metrics.last_run_timestamp.load(.monotonic),
+                .enabled = self.config.gc_config.enabled,
+                .total_runs = gc_metrics.total_runs.load(.monotonic),
+                .total_bytes_reclaimed = gc_metrics.total_bytes_reclaimed.load(.monotonic),
+                .last_run_duration_ms = gc_metrics.last_run_duration_ms.load(.monotonic),
+                .last_run_timestamp = gc_metrics.last_run_timestamp.load(.monotonic),
                 .next_run_estimate_ms = 0, // TODO: Calculate based on interval
             },
             .performance = self.metrics_collector.getPerformanceMetrics(),
@@ -1351,152 +1055,3 @@ pub const Db = struct {
         return try self.metrics_collector.exportJson(snapshot);
     }
 };
-
-// NOTE: Db requires full system setup (Config, Io, Index) for testing.
-// Full integration tests are located in tests/integration_test.zig.
-// Unit tests for helper structs are below.
-
-// ============================================================================
-// Unit Tests for Helper Structs
-// ============================================================================
-
-test "VLogStats - deadRatio with zero bytes" {
-    const stats = VLogStats{
-        .total_bytes = 0,
-        .live_bytes = 0,
-        .dead_bytes = 0,
-        .count = 0,
-        .deleted = 0,
-        .last_gc_ts = 0,
-    };
-
-    try std.testing.expectEqual(@as(f64, 0.0), stats.deadRatio());
-}
-
-test "VLogStats - deadRatio calculation" {
-    const stats = VLogStats{
-        .total_bytes = 1000,
-        .live_bytes = 500,
-        .dead_bytes = 500,
-        .count = 100,
-        .deleted = 50,
-        .last_gc_ts = 1234567890,
-    };
-
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), stats.deadRatio(), 0.001);
-}
-
-test "VLogStats - deadRatio with all dead" {
-    const stats = VLogStats{
-        .total_bytes = 1000,
-        .live_bytes = 0,
-        .dead_bytes = 1000,
-        .count = 100,
-        .deleted = 100,
-        .last_gc_ts = 0,
-    };
-
-    try std.testing.expectApproxEqAbs(@as(f64, 1.0), stats.deadRatio(), 0.001);
-}
-
-test "VLogStats - deadRatio with all live" {
-    const stats = VLogStats{
-        .total_bytes = 1000,
-        .live_bytes = 1000,
-        .dead_bytes = 0,
-        .count = 100,
-        .deleted = 0,
-        .last_gc_ts = 0,
-    };
-
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0), stats.deadRatio(), 0.001);
-}
-
-test "VLogStats - isGcCandidate below threshold" {
-    const stats = VLogStats{
-        .total_bytes = 1000,
-        .live_bytes = 800,
-        .dead_bytes = 200, // 20% dead
-        .count = 100,
-        .deleted = 20,
-        .last_gc_ts = 0,
-    };
-
-    try std.testing.expect(!stats.isGcCandidate(0.5)); // 50% threshold
-}
-
-test "VLogStats - isGcCandidate above threshold" {
-    const stats = VLogStats{
-        .total_bytes = 1000,
-        .live_bytes = 300,
-        .dead_bytes = 700, // 70% dead
-        .count = 100,
-        .deleted = 70,
-        .last_gc_ts = 0,
-    };
-
-    try std.testing.expect(stats.isGcCandidate(0.5)); // 50% threshold
-}
-
-test "VLogStats - isGcCandidate at exactly threshold" {
-    const stats = VLogStats{
-        .total_bytes = 1000,
-        .live_bytes = 500,
-        .dead_bytes = 500, // 50% dead
-        .count = 100,
-        .deleted = 50,
-        .last_gc_ts = 0,
-    };
-
-    try std.testing.expect(stats.isGcCandidate(0.5)); // Exactly at threshold
-}
-
-test "GcConfig - default values" {
-    const config = GcConfig{};
-
-    try std.testing.expect(config.enabled);
-    try std.testing.expectEqual(@as(u64, 300), config.interval_seconds);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), config.dead_ratio_threshold, 0.001);
-    try std.testing.expectEqual(@as(usize, 1), config.max_concurrent);
-}
-
-test "GcConfig - custom values" {
-    const config = GcConfig{
-        .enabled = false,
-        .interval_seconds = 600,
-        .dead_ratio_threshold = 0.3,
-        .max_concurrent = 4,
-    };
-
-    try std.testing.expect(!config.enabled);
-    try std.testing.expectEqual(@as(u64, 600), config.interval_seconds);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.3), config.dead_ratio_threshold, 0.001);
-    try std.testing.expectEqual(@as(usize, 4), config.max_concurrent);
-}
-
-test "GcMetrics - initial values are zero" {
-    const metrics = GcMetrics{};
-
-    try std.testing.expectEqual(@as(u64, 0), metrics.total_runs.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), metrics.total_bytes_reclaimed.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), metrics.last_run_duration_ms.load(.monotonic));
-    try std.testing.expectEqual(@as(i64, 0), metrics.last_run_timestamp.load(.monotonic));
-}
-
-test "GcMetrics - atomic operations" {
-    var metrics = GcMetrics{};
-
-    // Test atomic increment
-    _ = metrics.total_runs.fetchAdd(1, .release);
-    try std.testing.expectEqual(@as(u64, 1), metrics.total_runs.load(.monotonic));
-
-    _ = metrics.total_runs.fetchAdd(1, .release);
-    try std.testing.expectEqual(@as(u64, 2), metrics.total_runs.load(.monotonic));
-
-    // Test atomic store
-    metrics.total_bytes_reclaimed.store(12345, .release);
-    try std.testing.expectEqual(@as(u64, 12345), metrics.total_bytes_reclaimed.load(.monotonic));
-
-    metrics.last_run_timestamp.store(9876543210, .release);
-    try std.testing.expectEqual(@as(i64, 9876543210), metrics.last_run_timestamp.load(.monotonic));
-}

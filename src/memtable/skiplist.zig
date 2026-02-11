@@ -240,10 +240,10 @@ pub const SkipList = struct {
         }
     }
 
-    pub fn del(self: *SkipList, key: u128) ?Entry {
-        if (self.header == null) return null;
+    pub fn del(self: *SkipList, key: u128) !void {
+        if (self.header == null) return error.NotFound;
 
-        var update = self.pool.alloc(?*Node, self.max_level + 1) catch return null;
+        var update = self.pool.alloc(?*Node, self.max_level + 1) catch return error.OutOfMemory;
         @memset(update, null);
 
         var current = self.header.?;
@@ -271,10 +271,8 @@ pub const SkipList = struct {
         const target_node = if (current.forward.len > 0) current.forward[0] else null;
 
         if (target_node == null or self.compare(target_node.?.key, key) != .eq) {
-            return null; // Key not found
+            return error.NotFound; // Key not found
         }
-
-        const old_entry = target_node.?.entry;
 
         // Update forward pointers
         var j: usize = 0;
@@ -293,7 +291,6 @@ pub const SkipList = struct {
         }
 
         self.count -= 1;
-        return old_entry;
     }
 
     pub fn len(self: *const SkipList) usize {
@@ -351,7 +348,7 @@ test "basic operations" {
     try std.testing.expect(value != null);
 
     // Test deleting an entry
-    _ = memtable.del(1);
+    try memtable.del(1);
 
     // Test getting an entry after delete
     const delval = memtable.get(1);

@@ -105,7 +105,7 @@ pub const MemTable = struct {
     }
 
     pub fn del(self: *MemTable, key: i128) !void {
-        _ = self.active.del(@bitCast(key));
+        return self.active.del(@bitCast(key));
     }
 
     /// Get current size of active skiplist
@@ -289,8 +289,8 @@ test "MemTable - delete nonexistent key does not error" {
     var mt = try MemTable.init(allocator, 1000);
     defer mt.deinit();
 
-    // Deleting a key that doesn't exist should not panic
-    try mt.del(999);
+    // Deleting a key that doesn't exist should return error.NotFound
+    try testing.expectError(error.NotFound, mt.del(999));
 }
 
 test "MemTable - put same key multiple times" {

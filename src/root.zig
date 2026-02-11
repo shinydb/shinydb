@@ -19,7 +19,6 @@ pub const milliTimestamp = @import("common/common.zig").milliTimestamp;
 pub const OpKind = @import("common/common.zig").OpKind;
 pub const Db = @import("storage/db.zig").Db;
 pub const ValueLog = @import("storage/vlog.zig").ValueLog;
-pub const Compressor = @import("storage/compression.zig").Compressor;
 pub const SchemaManager = @import("storage/schema.zig").SchemaManager;
 pub const Index = @import("storage/bptree.zig").Index;
 pub const IndexConfig = @import("storage/bptree.zig").IndexConfig;
@@ -43,7 +42,6 @@ test {
     _ = @import("common/common.zig");
 
     // Storage modules
-    _ = @import("storage/compression.zig");
     _ = @import("storage/vlog.zig");
     _ = @import("storage/schema.zig");
     _ = @import("storage/bptree.zig");

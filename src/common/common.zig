@@ -30,12 +30,14 @@ pub const VlogEntry = struct {
     key: u128,
     value: []const u8,
     timestamp: i64,
+    tombstone: bool = false,
 
     pub fn write(self: *const VlogEntry, writer: anytype) anyerror!void {
         try writer.writeInt(u128, self.key, .little);
         try writer.writeInt(u64, self.value.len, .little);
         _ = try writer.writeAll(self.value);
         try writer.writeInt(i64, self.timestamp, .little);
+        try writer.writeInt(u8, if (self.tombstone) 1 else 0, .little);
 
         const seed: u64 = 0;
         var hasher = std.hash.Wyhash.init(seed);
@@ -43,6 +45,8 @@ pub const VlogEntry = struct {
         hasher.update(std.mem.asBytes(&self.value.len));
         hasher.update(self.value);
         hasher.update(std.mem.asBytes(&self.timestamp));
+        const tombstone_byte: u8 = if (self.tombstone) 1 else 0;
+        hasher.update(std.mem.asBytes(&tombstone_byte));
 
         const checksum = hasher.final();
         try writer.writeInt(u64, checksum, .little);
@@ -55,6 +59,7 @@ pub const VlogEntry = struct {
         defer allocator.free(value_buff);
         _ = try reader.readAll(value_buff);
         const timestamp = try reader.readInt(i64, .little);
+        const tombstone_byte = try reader.readInt(u8, .little);
 
         const file_checksum = try reader.readInt(u64, .little);
 
@@ -64,6 +69,7 @@ pub const VlogEntry = struct {
         hasher.update(std.mem.asBytes(&value_len));
         hasher.update(value_buff);
         hasher.update(std.mem.asBytes(&timestamp));
+        hasher.update(std.mem.asBytes(&tombstone_byte));
         const checksum = hasher.final();
         if (file_checksum != checksum) {
             return error.InvalidChecksum;
@@ -73,12 +79,16 @@ pub const VlogEntry = struct {
             .key = key,
             .value = try allocator.dupe(u8, value_buff),
             .timestamp = timestamp,
+            .tombstone = tombstone_byte != 0,
         };
     }
 
     pub fn readFromSlice(allocator: std.mem.Allocator, data: []const u8) !VlogEntry {
         // Parse entry from buffer
         var offset: usize = 0;
+
+        // Ensure we have minimum required bytes for the fixed fields
+        if (data.len < 41) return error.BufferTooSmall; // 16+8+8+1+8 = 41 minimum
 
         // Read key (16 bytes)
         const key = std.mem.readInt(u128, data[offset..][0..16], .little);
@@ -88,6 +98,10 @@ pub const VlogEntry = struct {
         const value_len = std.mem.readInt(u64, data[offset..][0..8], .little);
         offset += 8;
 
+        // Ensure we have enough data for the complete entry
+        const expected_total_size = 41 + value_len;
+        if (data.len < expected_total_size) return error.BufferTooSmall;
+
         // Read value (variable length)
         const value_data = data[offset .. offset + value_len];
         offset += value_len;
@@ -95,6 +109,10 @@ pub const VlogEntry = struct {
         // Read timestamp (8 bytes)
         const timestamp = std.mem.readInt(i64, data[offset..][0..8], .little);
         offset += 8;
+
+        // Read tombstone flag (1 byte)
+        const tombstone_byte = data[offset];
+        offset += 1;
 
         // Read checksum (8 bytes)
         const file_checksum = std.mem.readInt(u64, data[offset..][0..8], .little);
@@ -106,6 +124,7 @@ pub const VlogEntry = struct {
         hasher.update(std.mem.asBytes(&value_len));
         hasher.update(value_data);
         hasher.update(std.mem.asBytes(&timestamp));
+        hasher.update(std.mem.asBytes(&tombstone_byte));
         const checksum = hasher.final();
         if (file_checksum != checksum) {
             return error.InvalidChecksum;
@@ -115,11 +134,12 @@ pub const VlogEntry = struct {
             .key = key,
             .value = try allocator.dupe(u8, value_data),
             .timestamp = timestamp,
+            .tombstone = tombstone_byte != 0,
         };
     }
 
     pub fn size(self: *const VlogEntry) usize {
-        return @sizeOf(i128) + @sizeOf(i64) + @sizeOf(u64) + self.value.len + @sizeOf(u64);
+        return @sizeOf(i128) + @sizeOf(i64) + @sizeOf(u64) + self.value.len + @sizeOf(u8) + @sizeOf(u64);
     }
 
     pub fn deinit(self: *VlogEntry, allocator: std.mem.Allocator) void {
@@ -128,24 +148,24 @@ pub const VlogEntry = struct {
 };
 
 // ======= Index Typess ========
-pub const NSValue = struct {
-    ns: []const u8,
-    field: []const u8,
-    value: []const u8,
-};
+// pub const NSValue = struct {
+//     ns: []const u8,
+//     field: []const u8,
+//     value: []const u8,
+// };
 
-pub const NSKeyOffset = struct {
-    nsv: NSValue,
-    key: u128,
-    offset: u64,
-};
+// pub const NSKeyOffset = struct {
+//     nsv: NSValue,
+//     key: u128,
+//     offset: u64,
+// };
 
-pub const IndexEntry = struct {
-    ns: []const u8,
-    value: []const u8,
-    key: u128,
-    offset: u64,
-};
+// pub const IndexEntry = struct {
+//     ns: []const u8,
+//     value: []const u8,
+//     key: u128,
+//     offset: u64,
+// };
 
 // ======= Index Typess ========
 
@@ -365,7 +385,7 @@ test "VlogEntry - size calculation" {
     };
 
     // key(16) + value_len(8) + value(10) + timestamp(8) + checksum(8) = 50
-    try std.testing.expectEqual(@as(u64, 50), entry.size());
+    try std.testing.expectEqual(@as(u64, 51), entry.size());
 }
 
 test "VlogEntry - size with empty value" {
@@ -375,8 +395,8 @@ test "VlogEntry - size with empty value" {
         .timestamp = 0,
     };
 
-    // key(16) + value_len(8) + value(0) + timestamp(8) + checksum(8) = 40
-    try std.testing.expectEqual(@as(u64, 40), entry.size());
+    // key(16) + value_len(8) + value(0) + timestamp(8) + checksum(8) + tombstone(1) = 41
+    try std.testing.expectEqual(@as(u64, 41), entry.size());
 }
 
 test "Entry - operation kinds" {
@@ -437,19 +457,19 @@ test "LogRecord - structure" {
     try std.testing.expectEqual(OpKind.insert, record.kind);
 }
 
-test "IndexEntry - structure" {
-    const entry = IndexEntry{
-        .ns = "test_ns",
-        .value = "test_value",
-        .key = 99999,
-        .offset = 1024,
-    };
+// test "IndexEntry - structure" {
+//     const entry = IndexEntry{
+//         .ns = "test_ns",
+//         .value = "test_value",
+//         .key = 99999,
+//         .offset = 1024,
+//     };
 
-    try std.testing.expectEqual(@as(u128, 99999), entry.key);
-    try std.testing.expectEqual(@as(u64, 1024), entry.offset);
-    try std.testing.expectEqualStrings("test_ns", entry.ns);
-    try std.testing.expectEqualStrings("test_value", entry.value);
-}
+//     try std.testing.expectEqual(@as(u128, 99999), entry.key);
+//     try std.testing.expectEqual(@as(u64, 1024), entry.offset);
+//     try std.testing.expectEqualStrings("test_ns", entry.ns);
+//     try std.testing.expectEqualStrings("test_value", entry.value);
+// }
 
 test "CurrentVlog - initial state" {
     const vlog = CurrentVlog{

@@ -12,9 +12,6 @@ connection_pool:
   write_timeout_ms: 60000
   idle_timeout_ms: 300000
   graceful_shutdown_timeout_ms: 30000
-datafiles:
-  pool_size: 16
-  flush_interval_in_ms: 1000
 buffers:
   memtable: 16777216
   vlog: 104857600
@@ -32,6 +29,11 @@ paths:
   wal: /tmp/shinydb/data/wals
   index: /tmp/shinydb/data/indexes
   metadata: /tmp/shinydb/data
+gc_config:
+  enabled: true
+  interval_seconds: 300
+  dead_ratio_threshold: 0.5
+  max_concurrent: 1
 index:
   primary:
     pool_size: 1024

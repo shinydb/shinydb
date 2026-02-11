@@ -56,107 +56,107 @@ pub const MetricsSnapshot = struct {
 };
 
 /// Thread-safe queue for pending connections
-pub const ConnectionQueue = struct {
-    allocator: Allocator,
-    queue: std.ArrayList(net.Stream),
-    mutex: Mutex,
-    condition: Condition,
-    shutdown: bool,
-    max_size: u32,
-    io: Io,
-    metrics: *PoolMetrics,
+// pub const ConnectionQueue = struct {
+//     allocator: Allocator,
+//     queue: std.ArrayList(net.Stream),
+//     mutex: Mutex,
+//     condition: Condition,
+//     shutdown: bool,
+//     max_size: u32,
+//     io: Io,
+//     metrics: *PoolMetrics,
 
-    const Self = @This();
+//     const Self = @This();
 
-    pub fn init(allocator: Allocator, io: Io, max_size: u32, metrics: *PoolMetrics) Self {
-        return Self{
-            .allocator = allocator,
-            .queue = .empty,
-            .mutex = .{},
-            .condition = .{},
-            .shutdown = false,
-            .max_size = max_size,
-            .io = io,
-            .metrics = metrics,
-        };
-    }
+//     pub fn init(allocator: Allocator, io: Io, max_size: u32, metrics: *PoolMetrics) Self {
+//         return Self{
+//             .allocator = allocator,
+//             .queue = .empty,
+//             .mutex = .{},
+//             .condition = .{},
+//             .shutdown = false,
+//             .max_size = max_size,
+//             .io = io,
+//             .metrics = metrics,
+//         };
+//     }
 
-    pub fn deinit(self: *Self) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+//     pub fn deinit(self: *Self) void {
+//         self.mutex.lock();
+//         defer self.mutex.unlock();
 
-        // Close all remaining connections in the queue
-        for (self.queue.items) |connection| {
-            connection.close(self.io);
-        }
-        self.queue.deinit(self.allocator);
-    }
+//         // Close all remaining connections in the queue
+//         for (self.queue.items) |connection| {
+//             connection.close(self.io);
+//         }
+//         self.queue.deinit(self.allocator);
+//     }
 
-    /// Push a connection to the queue (rejects if full)
-    pub fn push(self: *Self, connection: net.Stream) !void {
-        // Add item to queue under lock
-        {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+//     /// Push a connection to the queue (rejects if full)
+//     pub fn push(self: *Self, connection: net.Stream) !void {
+//         // Add item to queue under lock
+//         {
+//             self.mutex.lock();
+//             defer self.mutex.unlock();
 
-            if (self.shutdown) {
-                return error.QueueShutdown;
-            }
+//             if (self.shutdown) {
+//                 return error.QueueShutdown;
+//             }
 
-            // Check queue size limit
-            if (self.queue.items.len >= self.max_size) {
-                _ = self.metrics.total_rejected.fetchAdd(1, .monotonic);
-                return error.QueueFull;
-            }
+//             // Check queue size limit
+//             if (self.queue.items.len >= self.max_size) {
+//                 _ = self.metrics.total_rejected.fetchAdd(1, .monotonic);
+//                 return error.QueueFull;
+//             }
 
-            try self.queue.append(self.allocator, connection);
-            _ = self.metrics.queued_connections.fetchAdd(1, .monotonic);
-        }
+//             try self.queue.append(self.allocator, connection);
+//             _ = self.metrics.queued_connections.fetchAdd(1, .monotonic);
+//         }
 
-        // Signal AFTER releasing the mutex - try signal() first (wakes one thread)
-        self.condition.signal();
-    }
+//         // Signal AFTER releasing the mutex - try signal() first (wakes one thread)
+//         self.condition.signal();
+//     }
 
-    /// Pop a connection from the queue (blocks if empty)
-    /// NOTE: Using polling approach as workaround for condition variable issues
-    pub fn pop(self: *Self) ?net.Stream {
-        while (!self.shutdown) {
-            {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+//     /// Pop a connection from the queue (blocks if empty)
+//     /// NOTE: Using polling approach as workaround for condition variable issues
+//     pub fn pop(self: *Self) ?net.Stream {
+//         while (!self.shutdown) {
+//             {
+//                 self.mutex.lock();
+//                 defer self.mutex.unlock();
 
-                // Check if queue has items
-                if (self.queue.items.len > 0) {
-                    // Use swapRemove for O(1) instead of orderedRemove O(n)
-                    const connection = self.queue.swapRemove(0);
-                    _ = self.metrics.queued_connections.fetchSub(1, .monotonic);
-                    return connection;
-                }
-            }
+//                 // Check if queue has items
+//                 if (self.queue.items.len > 0) {
+//                     // Use swapRemove for O(1) instead of orderedRemove O(n)
+//                     const connection = self.queue.swapRemove(0);
+//                     _ = self.metrics.queued_connections.fetchSub(1, .monotonic);
+//                     return connection;
+//                 }
+//             }
 
-            // Yield to other threads and sleep briefly to avoid busy-waiting
-            std.Thread.yield() catch {};
-            std.time.sleep(1 * std.time.ns_per_ms); // 1ms sleep
-        }
+//             // Yield to other threads and sleep briefly to avoid busy-waiting
+//             std.Thread.yield() catch {};
+//             std.time.sleep(1 * std.time.ns_per_ms); // 1ms sleep
+//         }
 
-        return null;
-    }
+//         return null;
+//     }
 
-    /// Get current queue size (for monitoring)
-    pub fn size(self: *Self) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return self.queue.items.len;
-    }
+//     /// Get current queue size (for monitoring)
+//     pub fn size(self: *Self) usize {
+//         self.mutex.lock();
+//         defer self.mutex.unlock();
+//         return self.queue.items.len;
+//     }
 
-    /// Signal shutdown to all waiting workers
-    pub fn shutdownQueue(self: *Self) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.shutdown = true;
-        self.condition.broadcast();
-    }
-};
+//     /// Signal shutdown to all waiting workers
+//     pub fn shutdownQueue(self: *Self) void {
+//         self.mutex.lock();
+//         defer self.mutex.unlock();
+//         self.shutdown = true;
+//         self.condition.broadcast();
+//     }
+// };
 
 /// Pool of reusable Session objects
 pub const SessionPool = struct {
@@ -320,171 +320,170 @@ pub const MessageBufferPool = struct {
     }
 };
 
-/// Worker thread pool for handling connections
-pub const WorkerPool = struct {
-    allocator: Allocator,
-    io: Io,
-    engine: *Engine,
-    connection_queue: ConnectionQueue,
-    session_pool: SessionPool,
-    message_buffer_pool: MessageBufferPool,
-    workers: []std.Thread,
-    worker_count: usize,
-    shutdown: bool,
-    metrics: PoolMetrics,
-    max_sessions: u32,
-    graceful_shutdown_timeout_ms: u64,
+// pub const WorkerPool = struct {
+//     allocator: Allocator,
+//     io: Io,
+//     engine: *Engine,
+//     connection_queue: ConnectionQueue,
+//     session_pool: SessionPool,
+//     message_buffer_pool: MessageBufferPool,
+//     workers: []std.Thread,
+//     worker_count: usize,
+//     shutdown: bool,
+//     metrics: PoolMetrics,
+//     max_sessions: u32,
+//     graceful_shutdown_timeout_ms: u64,
 
-    const Self = @This();
+//     const Self = @This();
 
-    pub fn init(allocator: Allocator, io: Io, engine: *Engine, worker_count: usize, max_queue_size: u32, max_sessions: u32, graceful_shutdown_timeout_ms: u64, idle_timeout_ms: u64) !Self {
-        // Create metrics first (needs to be on heap since ConnectionQueue stores a pointer)
-        const metrics_ptr = try allocator.create(PoolMetrics);
-        metrics_ptr.* = PoolMetrics.init();
-        errdefer allocator.destroy(metrics_ptr);
+//     pub fn init(allocator: Allocator, io: Io, engine: *Engine, worker_count: usize, max_queue_size: u32, max_sessions: u32, graceful_shutdown_timeout_ms: u64, idle_timeout_ms: u64) !Self {
+//         // Create metrics first (needs to be on heap since ConnectionQueue stores a pointer)
+//         const metrics_ptr = try allocator.create(PoolMetrics);
+//         metrics_ptr.* = PoolMetrics.init();
+//         errdefer allocator.destroy(metrics_ptr);
 
-        const connection_queue = ConnectionQueue.init(allocator, io, max_queue_size, metrics_ptr);
+//         const connection_queue = ConnectionQueue.init(allocator, io, max_queue_size, metrics_ptr);
 
-        // Initialize message buffer pool (64KB default size, pool size = worker_count)
-        // Must be created before session_pool since it needs a pointer to it
-        const message_buffer_pool_ptr = try allocator.create(MessageBufferPool);
-        message_buffer_pool_ptr.* = try MessageBufferPool.init(allocator, 64 * 1024, worker_count);
-        errdefer {
-            message_buffer_pool_ptr.deinit();
-            allocator.destroy(message_buffer_pool_ptr);
-        }
+//         // Initialize message buffer pool (64KB default size, pool size = worker_count)
+//         // Must be created before session_pool since it needs a pointer to it
+//         const message_buffer_pool_ptr = try allocator.create(MessageBufferPool);
+//         message_buffer_pool_ptr.* = try MessageBufferPool.init(allocator, 64 * 1024, worker_count);
+//         errdefer {
+//             message_buffer_pool_ptr.deinit();
+//             allocator.destroy(message_buffer_pool_ptr);
+//         }
 
-        var session_pool = try SessionPool.init(allocator, io, engine, worker_count, idle_timeout_ms, message_buffer_pool_ptr);
-        errdefer session_pool.deinit();
+//         var session_pool = try SessionPool.init(allocator, io, engine, worker_count, idle_timeout_ms, message_buffer_pool_ptr);
+//         errdefer session_pool.deinit();
 
-        const workers = try allocator.alloc(std.Thread, worker_count);
-        errdefer allocator.free(workers);
+//         const workers = try allocator.alloc(std.Thread, worker_count);
+//         errdefer allocator.free(workers);
 
-        return Self{
-            .allocator = allocator,
-            .io = io,
-            .engine = engine,
-            .connection_queue = connection_queue,
-            .session_pool = session_pool,
-            .message_buffer_pool = message_buffer_pool_ptr.*,
-            .workers = workers,
-            .worker_count = worker_count,
-            .shutdown = false,
-            .metrics = metrics_ptr.*,
-            .max_sessions = max_sessions,
-            .graceful_shutdown_timeout_ms = graceful_shutdown_timeout_ms,
-        };
-    }
+//         return Self{
+//             .allocator = allocator,
+//             .io = io,
+//             .engine = engine,
+//             .connection_queue = connection_queue,
+//             .session_pool = session_pool,
+//             .message_buffer_pool = message_buffer_pool_ptr.*,
+//             .workers = workers,
+//             .worker_count = worker_count,
+//             .shutdown = false,
+//             .metrics = metrics_ptr.*,
+//             .max_sessions = max_sessions,
+//             .graceful_shutdown_timeout_ms = graceful_shutdown_timeout_ms,
+//         };
+//     }
 
-    /// Start the worker threads (must be called after init)
-    pub fn start(self: *Self) !void {
-        // Spawn worker threads
-        for (self.workers, 0..) |*worker, i| {
-            worker.* = try std.Thread.spawn(.{}, workerLoop, .{ self, i });
-        }
+//     /// Start the worker threads (must be called after init)
+//     pub fn start(self: *Self) !void {
+//         // Spawn worker threads
+//         for (self.workers, 0..) |*worker, i| {
+//             worker.* = try std.Thread.spawn(.{}, workerLoop, .{ self, i });
+//         }
 
-        log.info("Worker pool started with {} workers", .{self.worker_count});
-    }
+//         log.info("Worker pool started with {} workers", .{self.worker_count});
+//     }
 
-    pub fn deinit(self: *Self) void {
-        log.info("Initiating graceful shutdown...", .{});
+//     pub fn deinit(self: *Self) void {
+//         log.info("Initiating graceful shutdown...", .{});
 
-        // Stop accepting new connections
-        self.shutdown = true;
+//         // Stop accepting new connections
+//         self.shutdown = true;
 
-        // Wait for queue to drain with timeout
-        const start_time = milliTimestamp();
-        const timeout_ms: i64 = @intCast(self.graceful_shutdown_timeout_ms);
+//         // Wait for queue to drain with timeout
+//         const start_time = milliTimestamp();
+//         const timeout_ms: i64 = @intCast(self.graceful_shutdown_timeout_ms);
 
-        while (self.connection_queue.size() > 0) {
-            const elapsed = milliTimestamp() - start_time;
-            if (elapsed > timeout_ms) {
-                log.warn("Graceful shutdown timeout reached, {} connections still queued", .{self.connection_queue.size()});
-                break;
-            }
-            // Yield CPU to avoid busy-waiting
-            std.Thread.yield() catch {};
-        }
+//         while (self.connection_queue.size() > 0) {
+//             const elapsed = milliTimestamp() - start_time;
+//             if (elapsed > timeout_ms) {
+//                 log.warn("Graceful shutdown timeout reached, {} connections still queued", .{self.connection_queue.size()});
+//                 break;
+//             }
+//             // Yield CPU to avoid busy-waiting
+//             std.Thread.yield() catch {};
+//         }
 
-        // Signal queue shutdown to wake up waiting workers
-        self.connection_queue.shutdownQueue();
+//         // Signal queue shutdown to wake up waiting workers
+//         self.connection_queue.shutdownQueue();
 
-        // Wait for all workers to finish current connections
-        for (self.workers) |worker| {
-            worker.join();
-        }
+//         // Wait for all workers to finish current connections
+//         for (self.workers) |worker| {
+//             worker.join();
+//         }
 
-        self.allocator.free(self.workers);
-        self.message_buffer_pool.deinit();
-        self.session_pool.deinit();
-        self.connection_queue.deinit();
+//         self.allocator.free(self.workers);
+//         self.message_buffer_pool.deinit();
+//         self.session_pool.deinit();
+//         self.connection_queue.deinit();
 
-        const metrics = self.metrics.snapshot();
-        log.info("Worker pool shutdown complete. Final stats: processed={}, rejected={}, errors={}", .{ metrics.total_processed, metrics.total_rejected, metrics.total_errors });
-    }
+//         const metrics = self.metrics.snapshot();
+//         log.info("Worker pool shutdown complete. Final stats: processed={}, rejected={}, errors={}", .{ metrics.total_processed, metrics.total_rejected, metrics.total_errors });
+//     }
 
-    /// Submit a connection to be handled by a worker
-    pub fn submitConnection(self: *Self, connection: net.Stream) !void {
-        // Check max_sessions limit
-        const active = self.metrics.active_connections.load(.monotonic);
-        const queued = self.metrics.queued_connections.load(.monotonic);
+//     /// Submit a connection to be handled by a worker
+//     pub fn submitConnection(self: *Self, connection: net.Stream) !void {
+//         // Check max_sessions limit
+//         const active = self.metrics.active_connections.load(.monotonic);
+//         const queued = self.metrics.queued_connections.load(.monotonic);
 
-        if (active + queued >= self.max_sessions) {
-            _ = self.metrics.total_rejected.fetchAdd(1, .monotonic);
-            return error.MaxSessionsReached;
-        }
+//         if (active + queued >= self.max_sessions) {
+//             _ = self.metrics.total_rejected.fetchAdd(1, .monotonic);
+//             return error.MaxSessionsReached;
+//         }
 
-        try self.connection_queue.push(connection);
-    }
+//         try self.connection_queue.push(connection);
+//     }
 
-    /// Worker thread main loop
-    fn workerLoop(self: *Self, worker_id: usize) void {
-        log.info("Worker {} started", .{worker_id});
+//     /// Worker thread main loop
+//     fn workerLoop(self: *Self, worker_id: usize) void {
+//         log.info("Worker {} started", .{worker_id});
 
-        while (!self.shutdown) {
-            // Get connection from queue (blocks until available)
-            const connection = self.connection_queue.pop() orelse break;
+//         while (!self.shutdown) {
+//             // Get connection from queue (blocks until available)
+//             const connection = self.connection_queue.pop() orelse break;
 
-            // Track active connection
-            _ = self.metrics.active_connections.fetchAdd(1, .monotonic);
-            defer _ = self.metrics.active_connections.fetchSub(1, .monotonic);
+//             // Track active connection
+//             _ = self.metrics.active_connections.fetchAdd(1, .monotonic);
+//             defer _ = self.metrics.active_connections.fetchSub(1, .monotonic);
 
-            // Acquire a session from the pool
-            var session = self.session_pool.acquire(connection) catch |err| {
-                log.err("Worker {} failed to acquire session: {}", .{ worker_id, err });
-                _ = self.metrics.total_errors.fetchAdd(1, .monotonic);
-                connection.close(self.io);
-                continue;
-            };
+//             // Acquire a session from the pool
+//             var session = self.session_pool.acquire(connection) catch |err| {
+//                 log.err("Worker {} failed to acquire session: {}", .{ worker_id, err });
+//                 _ = self.metrics.total_errors.fetchAdd(1, .monotonic);
+//                 connection.close(self.io);
+//                 continue;
+//             };
 
-            // Handle the connection
-            session.run() catch |err| {
-                if (err == error.IdleTimeout) {
-                    _ = self.metrics.total_timeouts.fetchAdd(1, .monotonic);
-                } else {
-                    log.err("Worker {} session error: {}", .{ worker_id, err });
-                    _ = self.metrics.total_errors.fetchAdd(1, .monotonic);
-                }
-            };
+//             // Handle the connection
+//             session.run() catch |err| {
+//                 if (err == error.IdleTimeout) {
+//                     _ = self.metrics.total_timeouts.fetchAdd(1, .monotonic);
+//                 } else {
+//                     log.err("Worker {} session error: {}", .{ worker_id, err });
+//                     _ = self.metrics.total_errors.fetchAdd(1, .monotonic);
+//                 }
+//             };
 
-            // Close connection
-            connection.close(self.io);
+//             // Close connection
+//             connection.close(self.io);
 
-            // Return session to pool
-            self.session_pool.release(session);
+//             // Return session to pool
+//             self.session_pool.release(session);
 
-            // Update processed count
-            _ = self.metrics.total_processed.fetchAdd(1, .monotonic);
-        }
+//             // Update processed count
+//             _ = self.metrics.total_processed.fetchAdd(1, .monotonic);
+//         }
 
-        log.info("Worker {} stopped", .{worker_id});
-    }
+//         log.info("Worker {} stopped", .{worker_id});
+//     }
 
-    /// Get current metrics snapshot
-    pub fn getMetrics(self: *const Self) MetricsSnapshot {
-        return self.metrics.snapshot();
-    }
-};
+//     /// Get current metrics snapshot
+//     pub fn getMetrics(self: *const Self) MetricsSnapshot {
+//         return self.metrics.snapshot();
+//     }
+// };
 
 // ============================================================================
 // Unit Tests
