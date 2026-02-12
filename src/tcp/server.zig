@@ -528,22 +528,16 @@ pub const Session = struct {
                             else => .none,
                         };
 
-                        self.security_manager.createUser(user_data.username, user_data.password_hash, role) catch |err| {
-                            const err_msg = try std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-                            break :blk Operation{ .Reply = .{ .status = .err, .data = err_msg } };
+                        self.security_manager.createUser(user_data.username, user_data.password_hash, role) catch {
+                            break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
                         };
 
-                        // Return API key
-                        const user = self.security_manager.users.get(user_data.username) orelse {
-                            break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
-                        };
-                        const response = try std.fmt.allocPrint(self.allocator, "{{\"api_key\":\"{s}\"}}", .{user.api_key});
-                        break :blk Operation{ .Reply = .{ .status = .ok, .data = response } };
+                        // Return API key - not critical for protocol, return null on success
+                        break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                     },
                     .Backup => {
                         // TODO: Not implemented yet
-                        const err_data = try self.allocator.dupe(u8, "Not implemented");
-                        break :blk Operation{ .Reply = .{ .status = .err, .data = err_data } };
+                        break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
                     },
                     .Document => {
                         return error.InvalidDocType;
@@ -568,16 +562,14 @@ pub const Session = struct {
                         break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                     },
                     .User => {
-                        self.security_manager.deleteUser(data.name) catch |err| {
-                            const err_msg = try std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-                            break :blk Operation{ .Reply = .{ .status = .err, .data = err_msg } };
+                        self.security_manager.deleteUser(data.name) catch {
+                            break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
                         };
                         break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                     },
                     .Backup => {
                         // TODO: Not implemented yet
-                        const err_data = try self.allocator.dupe(u8, "Not implemented");
-                        break :blk Operation{ .Reply = .{ .status = .err, .data = err_data } };
+                        break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
                     },
                     .Document => {
                         return error.InvalidDocType;
@@ -618,8 +610,9 @@ pub const Session = struct {
             // ========== DOCUMENT DATA OPERATIONS (Tag 103-107) ==========
             .Insert => |data| blk: {
                 const key = try self.engine.post(data.store_ns, data.payload);
-                const response_json = try std.fmt.allocPrint(self.allocator, "{{\"key\":\"{x:0>32}\"}}", .{key});
-                break :blk Operation{ .Reply = .{ .status = .ok, .data = response_json } };
+                // Return null - success is implicit in .ok status, key is not needed by client
+                _ = key; // Suppress unused warning
+                break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
             },
             .BatchInsert => |data| blk: {
                 // Process batch of document insertions with optimized engine batch operation
@@ -652,18 +645,17 @@ pub const Session = struct {
             },
             .Update => |data| blk: {
                 try self.engine.put(data.id, data.payload);
-                const response_json = try self.allocator.dupe(u8, "{\"success\":true}");
-                break :blk Operation{ .Reply = .{ .status = .ok, .data = response_json } };
+                // Return null (success is implicit in .ok status)
+                break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
             },
             .Delete => |data| blk: {
                 if (data.id) |id| {
                     try self.engine.del(id);
-                    const response_json = try self.allocator.dupe(u8, "{\"success\":true}");
-                    break :blk Operation{ .Reply = .{ .status = .ok, .data = response_json } };
+                    // Return null (success is implicit in .ok status)
+                    break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                 } else {
                     // Query-based delete not yet supported
-                    const err_data = try self.allocator.dupe(u8, "Query-based delete not yet supported");
-                    break :blk Operation{ .Reply = .{ .status = .err, .data = err_data } };
+                    break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
                 }
             },
 
@@ -691,44 +683,23 @@ pub const Session = struct {
                     self.allocator.free(docs);
                 }
 
-                // Return as JSON array
-                var json_parts = std.ArrayList([]const u8).empty;
-                defer {
-                    for (json_parts.items) |part| {
-                        self.allocator.free(part);
-                    }
-                    json_parts.deinit(self.allocator);
-                }
-
+                // Build BSON array response: bson_doc1 bson_doc2 ...
+                // Concatenate BSON documents directly without brackets
+                var total_len: usize = 0;
                 for (docs) |doc| {
-                    const doc_json = try std.fmt.allocPrint(
-                        self.allocator,
-                        "{{\"key\":\"{x:0>32}\",\"value\":{s}}}",
-                        .{ doc.key, doc.value },
-                    );
-                    try json_parts.append(self.allocator, doc_json);
+                    total_len += doc.value.len;
                 }
 
-                // Join all parts with commas
-                var total_len: usize = 2; // For '[' and ']'
-                for (json_parts.items, 0..) |part, i| {
-                    total_len += part.len;
-                    if (i > 0) total_len += 1; // For comma
+                if (total_len == 0) {
+                    break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                 }
 
                 const value = try self.allocator.alloc(u8, total_len);
                 var pos: usize = 0;
-                value[pos] = '[';
-                pos += 1;
-                for (json_parts.items, 0..) |part, i| {
-                    if (i > 0) {
-                        value[pos] = ',';
-                        pos += 1;
-                    }
-                    @memcpy(value[pos..][0..part.len], part);
-                    pos += part.len;
+                for (docs) |doc| {
+                    @memcpy(value[pos..][0..doc.value.len], doc.value);
+                    pos += doc.value.len;
                 }
-                value[pos] = ']';
 
                 break :blk Operation{ .Reply = .{ .status = .ok, .data = value } };
             },
@@ -737,6 +708,27 @@ pub const Session = struct {
                 if (hasAggregateField(data.query_json)) {
                     // Route to aggregation handler
                     const result = try self.engine.aggregateDocs(data.store_ns, data.query_json);
+                    break :blk Operation{ .Reply = .{ .status = .ok, .data = result } };
+                }
+
+                // Check if this is a count-only query
+                if (hasCountField(data.query_json)) {
+                    // Run query but return only the count as a BSON document
+                    const docs = try self.engine.queryDocs(data.store_ns, data.query_json);
+                    const count = docs.len;
+                    defer {
+                        for (docs) |doc| {
+                            self.allocator.free(doc.value);
+                        }
+                        self.allocator.free(docs);
+                    }
+
+                    // Build BSON document: {"count": N}
+                    var count_doc = bson.BsonDocument.empty(self.allocator);
+                    defer count_doc.deinit();
+                    try count_doc.putInt64("count", @intCast(count));
+                    const count_bytes = count_doc.toBytes();
+                    const result = try self.allocator.dupe(u8, count_bytes);
                     break :blk Operation{ .Reply = .{ .status = .ok, .data = result } };
                 }
 
@@ -749,41 +741,23 @@ pub const Session = struct {
                     self.allocator.free(docs);
                 }
 
-                // Build JSON array response with just document values (no key wrapper)
-                var json_parts = std.ArrayList([]const u8).empty;
-                defer {
-                    for (json_parts.items) |part| {
-                        self.allocator.free(part);
-                    }
-                    json_parts.deinit(self.allocator);
-                }
-
+                // Build BSON array response: bson_doc1 bson_doc2 ...
+                // Each bson_doc is already complete BSON with size prefix and null terminator
+                var total_len: usize = 0;
                 for (docs) |doc| {
-                    // Return just the document value for cleaner output
-                    const doc_json = try self.allocator.dupe(u8, doc.value);
-                    try json_parts.append(self.allocator, doc_json);
+                    total_len += doc.value.len;
                 }
 
-                // Join all parts
-                var total_len: usize = 2;
-                for (json_parts.items, 0..) |part, i| {
-                    total_len += part.len;
-                    if (i > 0) total_len += 1;
+                if (total_len == 0) {
+                    break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
                 }
 
                 const value = try self.allocator.alloc(u8, total_len);
                 var pos: usize = 0;
-                value[pos] = '[';
-                pos += 1;
-                for (json_parts.items, 0..) |part, i| {
-                    if (i > 0) {
-                        value[pos] = ',';
-                        pos += 1;
-                    }
-                    @memcpy(value[pos..][0..part.len], part);
-                    pos += part.len;
+                for (docs) |doc| {
+                    @memcpy(value[pos..][0..doc.value.len], doc.value);
+                    pos += doc.value.len;
                 }
-                value[pos] = ']';
 
                 break :blk Operation{ .Reply = .{ .status = .ok, .data = value } };
             },
@@ -801,74 +775,48 @@ pub const Session = struct {
                     self.allocator.free(docs);
                 }
 
-                // Pre-calculate total size to avoid reallocations
-                var total_len: usize = 2; // For '[' and ']'
-                for (docs, 0..) |doc, i| {
-                    total_len += 17 + 32 + 11; // {"key":"...","value":
+                // Build BSON array response: bson_doc1 bson_doc2 ...
+                var total_len: usize = 0;
+                for (docs) |doc| {
                     total_len += doc.value.len;
-                    total_len += 1; // closing }
-                    if (i > 0) total_len += 1; // comma
                 }
 
-                // Build JSON array in a single allocation
+                if (total_len == 0) {
+                    break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
+                }
+
                 const value = try self.allocator.alloc(u8, total_len);
                 errdefer self.allocator.free(value);
 
                 var pos: usize = 0;
-                value[pos] = '[';
-                pos += 1;
-
-                for (docs, 0..) |doc, i| {
-                    if (i > 0) {
-                        value[pos] = ',';
-                        pos += 1;
-                    }
-                    // Write: {"key":"<hex>","value":<doc_value>}
-                    const key_str = try std.fmt.bufPrint(
-                        value[pos..],
-                        "{{\"key\":\"{x:0>32}\",\"value\":{s}}}",
-                        .{ doc.key, doc.value },
-                    );
-                    pos += key_str.len;
+                for (docs) |doc| {
+                    @memcpy(value[pos..][0..doc.value.len], doc.value);
+                    pos += doc.value.len;
                 }
-
-                value[pos] = ']';
 
                 break :blk Operation{ .Reply = .{ .status = .ok, .data = value } };
             },
 
             // ========== AUTHENTICATION OPERATIONS (Tag 111-113) ==========
             .Authenticate => |data| blk: {
-                const session = self.security_manager.authenticate(data.username, data.password) catch |err| {
-                    const err_msg = try std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-                    break :blk Operation{ .Reply = .{ .status = .err, .data = err_msg } };
+                const session = self.security_manager.authenticate(data.username, data.password) catch {
+                    break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
                 };
                 // Store session for this connection
                 self.security_session = session;
                 self.authenticated = true;
-                // Return session info
-                const response = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"session_id\":\"{s}\",\"username\":\"{s}\",\"role\":\"{s}\"}}",
-                    .{ session.session_id, session.username, session.permissions.toRoleName() },
-                );
-                break :blk Operation{ .Reply = .{ .status = .ok, .data = response } };
+                // Return null - authentication success is implicit in .ok status
+                break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
             },
             .AuthenticateApiKey => |data| blk: {
-                const session = self.security_manager.authenticateApiKey(data.api_key) catch |err| {
-                    const err_msg = try std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-                    break :blk Operation{ .Reply = .{ .status = .err, .data = err_msg } };
+                const session = self.security_manager.authenticateApiKey(data.api_key) catch {
+                    break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
                 };
                 // Store session for this connection
                 self.security_session = session;
                 self.authenticated = true;
-                // Return session info
-                const response = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{{\"session_id\":\"{s}\",\"username\":\"{s}\",\"role\":\"{s}\"}}",
-                    .{ session.session_id, session.username, session.permissions.toRoleName() },
-                );
-                break :blk Operation{ .Reply = .{ .status = .ok, .data = response } };
+                // Return null - authentication success is implicit in .ok status
+                break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
             },
             .Logout => blk: {
                 if (self.security_session) |session| {
@@ -881,9 +829,8 @@ pub const Session = struct {
 
             // ========== USER MANAGEMENT OPERATIONS (Tag 114) ==========
             .ResetPassword => |data| blk: {
-                self.security_manager.changePassword(data.username, data.old_password, data.new_password) catch |err| {
-                    const err_msg = try std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)});
-                    break :blk Operation{ .Reply = .{ .status = .err, .data = err_msg } };
+                self.security_manager.changePassword(data.username, data.old_password, data.new_password) catch {
+                    break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
                 };
                 break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
             },
@@ -891,13 +838,11 @@ pub const Session = struct {
             // ========== BACKUP OPERATIONS (Tag 115-116) ==========
             .Restore => blk: {
                 // TODO: Implement backup restore
-                const err_data = try self.allocator.dupe(u8, "Not implemented");
-                break :blk Operation{ .Reply = .{ .status = .err, .data = err_data } };
+                break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
             },
             .CleanBackups => blk: {
                 // TODO: Implement backup cleanup
-                const err_data = try self.allocator.dupe(u8, "Not implemented");
-                break :blk Operation{ .Reply = .{ .status = .err, .data = err_data } };
+                break :blk Operation{ .Reply = .{ .status = .err, .data = null } };
             },
 
             // ========== SERVER CONTROL OPERATIONS (Tag 117-120) ==========
@@ -976,4 +921,9 @@ fn hasAggregateField(query_json: []const u8) bool {
     // Simple string search for "aggregate" key
     // This is efficient and avoids full JSON parsing
     return std.mem.indexOf(u8, query_json, "\"aggregate\"") != null;
+}
+
+/// Check if JSON query contains a "count" field (count-only query)
+fn hasCountField(query_json: []const u8) bool {
+    return std.mem.indexOf(u8, query_json, "\"count\":true") != null;
 }

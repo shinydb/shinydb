@@ -553,6 +553,16 @@ pub const ParsedQuery = struct {
         return null;
     }
 
+    /// Get the best equality predicate for secondary index lookup.
+    /// Only returns equality predicates since findBySecondaryIndex
+    /// only supports exact-value lookups, not range scans.
+    pub fn getBestEqIndexPredicate(self: *const ParsedQuery) ?Predicate {
+        for (self.predicates.items) |pred| {
+            if (pred.operator == .eq) return pred;
+        }
+        return null;
+    }
+
     /// Get range bounds for a field (returns min_bound, max_bound)
     pub fn getRangeBounds(self: *const ParsedQuery, field_name: []const u8) struct { min: ?i64, max: ?i64, min_inclusive: bool, max_inclusive: bool } {
         var result: struct { min: ?i64, max: ?i64, min_inclusive: bool, max_inclusive: bool } = .{
@@ -626,7 +636,7 @@ pub fn parseJsonQuery(allocator: Allocator, json_str: []const u8) !ParsedQuery {
         }
     }
 
-    // Parse sort
+    // Parse sort (supports both "sort" and "orderBy" formats)
     if (root.object.get("sort")) |sort_val| {
         if (sort_val == .object) {
             var it = sort_val.object.iterator();
@@ -634,6 +644,20 @@ pub fn parseJsonQuery(allocator: Allocator, json_str: []const u8) !ParsedQuery {
                 query.sort_field = try allocator.dupe(u8, entry.key_ptr.*);
                 if (entry.value_ptr.* == .integer) {
                     query.sort_ascending = entry.value_ptr.integer >= 0;
+                }
+            }
+        }
+    } else if (root.object.get("orderBy")) |ob_val| {
+        // Client sends: "orderBy":{"field":"ListPrice","direction":"asc"}
+        if (ob_val == .object) {
+            if (ob_val.object.get("field")) |field_val| {
+                if (field_val == .string) {
+                    query.sort_field = try allocator.dupe(u8, field_val.string);
+                    if (ob_val.object.get("direction")) |dir_val| {
+                        if (dir_val == .string) {
+                            query.sort_ascending = !std.mem.eql(u8, dir_val.string, "desc");
+                        }
+                    }
                 }
             }
         }
@@ -726,6 +750,7 @@ fn parseFilterObject(query: *ParsedQuery, obj: std.json.ObjectMap) !void {
 }
 
 fn parseOperatorObject(query: *ParsedQuery, field_name: []const u8, obj: std.json.ObjectMap) !void {
+    var first = true;
     var it = obj.iterator();
     while (it.next()) |entry| {
         const op_str = entry.key_ptr.*;
@@ -734,8 +759,14 @@ fn parseOperatorObject(query: *ParsedQuery, field_name: []const u8, obj: std.jso
         const operator = parseOperatorString(op_str) orelse continue;
         const value = try parseJsonValueAlloc(query.allocator, op_value) orelse continue;
 
+        // First predicate uses the already-duped field_name from caller;
+        // subsequent predicates for the same field need their own copy
+        // so that deinit() can free each independently.
+        const name = if (first) field_name else try query.allocator.dupe(u8, field_name);
+        first = false;
+
         try query.predicates.append(query.allocator, .{
-            .field_name = field_name,
+            .field_name = name,
             .operator = operator,
             .value = value,
         });

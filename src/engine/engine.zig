@@ -722,11 +722,18 @@ pub const Engine = struct {
         self.catalog_mutex.unlock();
 
         // Get limit and offset
-        const actual_limit = parsed.limit orelse 100;
+        const actual_limit = parsed.limit orelse std.math.maxInt(u32);
         const actual_offset = parsed.offset;
 
-        // Determine if we can use an index
-        const best_predicate = parsed.getBestIndexPredicate();
+        // When sorting is requested, we must collect ALL matching docs first,
+        // sort them, then apply limit/offset. Otherwise we'd truncate before sorting.
+        const has_sort = parsed.sort_field != null;
+        const collect_limit: u32 = if (has_sort) std.math.maxInt(u32) else actual_limit;
+        const collect_offset: u32 = if (has_sort) 0 else actual_offset;
+
+        // Determine if we can use an index (only for equality predicates,
+        // since findBySecondaryIndex only supports exact-value lookups)
+        const best_predicate = parsed.getBestEqIndexPredicate();
 
         var results: std.ArrayList(Entry) = .empty;
         errdefer {
@@ -742,7 +749,7 @@ pub const Engine = struct {
             var indexes = self.catalog.getIndexesForStore(store_ns, self.allocator) catch {
                 self.catalog_mutex.unlock();
                 // No indexes found, do full scan
-                try self.fullScanWithFilter(&results, store_id, &parsed, actual_limit, actual_offset);
+                try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
                 return results.toOwnedSlice(self.allocator);
             };
             defer indexes.deinit(self.allocator);
@@ -757,75 +764,61 @@ pub const Engine = struct {
             }
 
             if (found_index) |index_ns| {
-                // Only use secondary index for equality predicates
-                // Range queries not yet supported via secondary index (findBySecondaryIndex only does equality lookup)
-                if (pred.operator == .eq) {
-                    // Use index lookup for equality
-                    const fv = pred.value;
-                    self.db_mutex.lock();
-                    var primary_keys = self.db.findBySecondaryIndex(index_ns, fv) catch |err| {
-                        self.db_mutex.unlock();
-                        return err;
-                    };
-                    defer primary_keys.deinit(self.allocator);
+                // Use secondary index to get candidate primary keys,
+                // then fetch documents and apply ALL predicates for correctness
+                self.db_mutex.lock();
+                var primary_keys = self.db.findBySecondaryIndex(index_ns, pred.value) catch |err| {
                     self.db_mutex.unlock();
+                    log.warn("Index lookup failed: {}, falling back to full scan", .{err});
+                    try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
+                    return results.toOwnedSlice(self.allocator);
+                };
+                defer primary_keys.deinit(self.allocator);
 
-                    // Fetch documents and apply remaining filters
-                    var skipped: u32 = 0;
-                    var count: u32 = 0;
-                    for (primary_keys.items) |key| {
-                        if (count >= actual_limit) break;
+                var skipped: u32 = 0;
+                var count: u32 = 0;
 
-                        // Fetch document
-                        self.db_mutex.lock();
-                        const value = self.db.get(@bitCast(key)) catch {
-                            self.db_mutex.unlock();
-                            continue;
-                        };
-                        self.db_mutex.unlock();
+                for (primary_keys.items) |key| {
+                    if (count >= collect_limit) break;
 
-                        // Apply remaining predicates (in-memory filter)
-                        var matches = true;
-                        for (parsed.predicates.items) |p| {
-                            if (std.mem.eql(u8, p.field_name, pred.field_name)) continue; // Skip equality index predicate (already filtered)
-                            if (!matchesPredicate(value, p)) {
-                                matches = false;
-                                break;
-                            }
+                    // Fetch document value
+                    const value = self.db.get(@bitCast(key)) catch continue;
+                    defer self.allocator.free(value);
+
+                    // Apply ALL predicates (including the indexed one)
+                    var matches = true;
+                    for (parsed.predicates.items) |p| {
+                        if (!matchesPredicate(value, p)) {
+                            matches = false;
+                            break;
                         }
-
-                        if (!matches) {
-                            self.allocator.free(value);
-                            continue;
-                        }
-
-                        // Apply offset
-                        if (skipped < actual_offset) {
-                            skipped += 1;
-                            self.allocator.free(value);
-                            continue;
-                        }
-
-                        try results.append(self.allocator, Entry{
-                            .key = key,
-                            .ns = "",
-                            .value = value,
-                            .timestamp = milliTimestamp(),
-                            .kind = .read,
-                        });
-                        count += 1;
                     }
-                } else {
-                    // Range predicate - fall back to full scan since secondary index only supports equality
-                    try self.fullScanWithFilter(&results, store_id, &parsed, actual_limit, actual_offset);
+                    if (!matches) continue;
+
+                    // Apply offset
+                    if (skipped < collect_offset) {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    const value_copy = try self.allocator.dupe(u8, value);
+                    try results.append(self.allocator, Entry{
+                        .key = key,
+                        .ns = "",
+                        .value = value_copy,
+                        .timestamp = milliTimestamp(),
+                        .kind = .read,
+                    });
+                    count += 1;
                 }
+                self.db_mutex.unlock();
             } else {
                 // No matching index - fall back to full scan
-                try self.fullScanWithFilter(&results, store_id, &parsed, actual_limit, actual_offset);
+                try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
             }
         } else {
             // No index - full scan
-            try self.fullScanWithFilter(&results, store_id, &parsed, actual_limit, actual_offset);
+            try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
         }
 
         // Sort results if order_by is specified
@@ -837,6 +830,23 @@ pub const Engine = struct {
                     return compareByField(a.value, b.value, ctx.field, ctx.ascending);
                 }
             }.lessThan);
+
+            // Apply offset and limit AFTER sorting
+            if (actual_offset > 0 or actual_limit < std.math.maxInt(u32)) {
+                const start = @min(actual_offset, @as(u32, @intCast(results.items.len)));
+                const end = @min(start +| actual_limit, @as(u32, @intCast(results.items.len)));
+                // Free entries outside the [start..end) range
+                for (results.items[0..start]) |entry| {
+                    self.allocator.free(entry.value);
+                }
+                for (results.items[end..]) |entry| {
+                    self.allocator.free(entry.value);
+                }
+                // Shift kept entries to front
+                const kept = results.items[start..end];
+                std.mem.copyForwards(Entry, results.items[0..kept.len], kept);
+                results.shrinkRetainingCapacity(kept.len);
+            }
         }
 
         return results.toOwnedSlice(self.allocator);
@@ -1788,44 +1798,59 @@ fn startsWithString(json_val: std.json.Value, field_val: FieldValue) bool {
     return std.mem.startsWith(u8, json_val.string, field_val.string);
 }
 
-/// Compare two documents by a field for sorting
-fn compareByField(a_json: []const u8, b_json: []const u8, field: []const u8, ascending: bool) bool {
+/// Compare two documents (BSON) by a field for sorting
+fn compareByField(a_bson: []const u8, b_bson: []const u8, field: []const u8, ascending: bool) bool {
     const allocator = std.heap.page_allocator;
 
-    const a_parsed = std.json.parseFromSlice(std.json.Value, allocator, a_json, .{}) catch return false;
-    defer a_parsed.deinit();
-    const b_parsed = std.json.parseFromSlice(std.json.Value, allocator, b_json, .{}) catch return true;
-    defer b_parsed.deinit();
+    const a_doc = bson.BsonDocument.init(allocator, a_bson, false) catch return false;
+    var a_mut = a_doc;
+    defer a_mut.deinit();
 
-    if (a_parsed.value != .object or b_parsed.value != .object) return false;
+    const b_doc = bson.BsonDocument.init(allocator, b_bson, false) catch return true;
+    var b_mut = b_doc;
+    defer b_mut.deinit();
 
-    const a_val = a_parsed.value.object.get(field) orelse return false;
-    const b_val = b_parsed.value.object.get(field) orelse return true;
+    const a_val_opt = blk: {
+        const result = a_doc.getField(field) catch break :blk null;
+        break :blk result;
+    };
+    const b_val_opt = blk: {
+        const result = b_doc.getField(field) catch break :blk null;
+        break :blk result;
+    };
 
-    const cmp = compareJsonValues(a_val, b_val);
+    const a_val = a_val_opt orelse return false;
+    const b_val = b_val_opt orelse return true;
+
+    const cmp = compareBsonValues(a_val, b_val);
     return if (ascending) cmp == .lt else cmp == .gt;
 }
 
-fn compareJsonValues(a: std.json.Value, b: std.json.Value) std.math.Order {
-    // Compare integers
-    if (a == .integer and b == .integer) {
-        return std.math.order(a.integer, b.integer);
-    }
-    // Compare floats
-    if ((a == .float or a == .integer) and (b == .float or b == .integer)) {
-        const af: f64 = if (a == .float) a.float else @floatFromInt(a.integer);
-        const bf: f64 = if (b == .float) b.float else @floatFromInt(b.integer);
-        return std.math.order(af, bf);
+fn compareBsonValues(a: bson.Value, b: bson.Value) std.math.Order {
+    // Compare numeric types (int32, int64, double) — cross-type comparisons
+    const a_num = bsonToF64(a);
+    const b_num = bsonToF64(b);
+    if (a_num != null and b_num != null) {
+        return std.math.order(a_num.?, b_num.?);
     }
     // Compare strings
     if (a == .string and b == .string) {
         return std.mem.order(u8, a.string, b.string);
     }
     // Compare booleans
-    if (a == .bool and b == .bool) {
-        return std.math.order(@as(u1, @intFromBool(a.bool)), @as(u1, @intFromBool(b.bool)));
+    if (a == .boolean and b == .boolean) {
+        return std.math.order(@as(u1, @intFromBool(a.boolean)), @as(u1, @intFromBool(b.boolean)));
     }
     return .eq;
+}
+
+fn bsonToF64(val: bson.Value) ?f64 {
+    return switch (val) {
+        .int32 => |v| @as(f64, @floatFromInt(v)),
+        .int64 => |v| @as(f64, @floatFromInt(v)),
+        .double => |v| v,
+        else => null,
+    };
 }
 
 // ============================================================================

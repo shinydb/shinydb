@@ -1280,7 +1280,10 @@ pub fn Index(comptime K: type, comptime V: type) type {
         }
 
         /// Flush all dirty pages to disk
+        /// Also persists the current root_page_id to the header page (page 0)
+        /// to ensure the tree structure is recoverable after restart.
         pub fn flush(self: *Self) !void {
+            try self.tree.shutdown();
             try self.tree.pool.flushAllPages();
         }
     };
