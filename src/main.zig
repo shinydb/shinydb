@@ -97,11 +97,12 @@ pub fn main() !void {
     const io = threaded.io();
 
     // Load configuration
-    const config = Config.load(allocator) catch |err| {
+    var config = Config.load(allocator) catch |err| {
         log.err("Failed to load config: {}", .{err});
         return err;
     };
-
+    defer config.deinit(allocator);
+    // Config ownership is transferred to db — db.deinit() frees it
     // Check for benchmark flag
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -132,9 +133,15 @@ pub fn main() !void {
     };
     defer server.deinit();
 
-    // Run the server (blocking)
+    // Run the server (blocking - returns when shutdown is requested)
     server.run() catch |err| {
         log.err("Server error: {}", .{err});
         return err;
+    };
+
+    // Graceful engine shutdown after server has stopped
+    log.info("Shutting down engine...", .{});
+    engine.shutdown() catch |err| {
+        log.err("Engine shutdown error: {}", .{err});
     };
 }

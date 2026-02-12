@@ -44,9 +44,9 @@ pub const Config = struct {
     },
     gc_config: struct {
         enabled: bool,
-        interval_seconds: u64,  
-        dead_ratio_threshold: f64,  
-        max_concurrent: usize,  
+        interval_seconds: u64,
+        dead_ratio_threshold: f64,
+        max_concurrent: usize,
     },
     index: struct {
         primary: struct {
@@ -62,6 +62,16 @@ pub const Config = struct {
         capacity: usize = 10000,
     } = .{},
 
+    pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
+        allocator.free(self.address);
+        allocator.free(self.base_dir);
+        allocator.free(self.paths.vlog);
+        allocator.free(self.paths.wal);
+        allocator.free(self.paths.index);
+        allocator.free(self.paths.metadata);
+        allocator.destroy(self);
+    }
+
     pub fn load(allocator: std.mem.Allocator) !*Config {
         // Use std.Io for file operations in Zig 0.16
         var threaded: Io.Threaded = .init(allocator, .{});
@@ -73,9 +83,26 @@ pub const Config = struct {
         defer allocator.free(content);
 
         var yaml: Yaml = .{ .source = content };
-        const cfg = try allocator.create(Config);
         try yaml.load(allocator);
-        cfg.* = try yaml.parse(allocator, Config);
+
+        // Use a temporary arena for yaml.parse() — the YAML library's parseValue
+        // double-dupes []const u8 fields (intermediate + final), leaking the intermediates.
+        // By parsing into an arena, all YAML allocations are bulk-freed, and we dupe
+        // only the strings we need into the real allocator.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const parsed = try yaml.parse(arena.allocator(), Config);
+        yaml.deinit(allocator);
+
+        const cfg = try allocator.create(Config);
+        cfg.* = parsed;
+        // Re-dupe string fields from arena into the real allocator
+        cfg.address = try allocator.dupe(u8, parsed.address);
+        cfg.base_dir = try allocator.dupe(u8, parsed.base_dir);
+        cfg.paths.vlog = try allocator.dupe(u8, parsed.paths.vlog);
+        cfg.paths.wal = try allocator.dupe(u8, parsed.paths.wal);
+        cfg.paths.index = try allocator.dupe(u8, parsed.paths.index);
+        cfg.paths.metadata = try allocator.dupe(u8, parsed.paths.metadata);
         return cfg;
     }
 };

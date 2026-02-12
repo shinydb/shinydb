@@ -128,25 +128,28 @@ pub const Db = struct {
         // Shutdown GC
         self.gc.deinit();
 
+        // Cleanup vlogs
         var vlog_iter = self.vlogs.iterator();
         while (vlog_iter.next()) |vlog| {
             vlog.value_ptr.*.deinit() catch {};
         }
+        self.vlogs.deinit();
 
         // Cleanup secondary indexes
         var idx_iter = self.secondary_indexes.iterator();
         while (idx_iter.next()) |entry| {
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
-            // Free the duplicated key string
             self.allocator.free(@constCast(entry.key_ptr.*));
         }
         self.secondary_indexes.deinit();
 
+        // Cleanup memtable
+        self.memtable.deinit();
+
         self.catalog.deinit();
         self.metrics_collector.deinit();
         self.wal.deinit() catch {};
-        self.allocator.destroy(self.config);
         self.allocator.destroy(self);
     }
 
@@ -280,6 +283,35 @@ pub const Db = struct {
         return error.NotFound;
     }
 
+    /// Get a document by key using a known vlog offset (avoids re-searching the primary index).
+    /// Used when the caller has already iterated the primary index and has the offset.
+    pub fn getByOffset(self: *Db, key: i128, offset: u64) ![]const u8 {
+        // First check memtable (most recent writes override flushed data)
+        const ret = self.memtable.get(key) catch |e| {
+            if (e == error.NotFound) {
+                // Use the provided offset to read directly from vlog
+                const key_u128: u128 = @bitCast(key);
+                const metadata = KeyGen.extractMetadata(key_u128);
+                if (self.vlogs.get(metadata.vlog_id)) |vlog| {
+                    var vlog_entry = try vlog.get(offset);
+                    defer vlog_entry.deinit(self.allocator);
+
+                    if (vlog_entry.tombstone) {
+                        return error.NotFound;
+                    }
+
+                    return try self.allocator.dupe(u8, vlog_entry.value);
+                }
+                return error.NotFound;
+            }
+            return e;
+        };
+        if (ret.len > 0) {
+            return try self.allocator.dupe(u8, ret);
+        }
+        return error.NotFound;
+    }
+
     pub fn del(self: *Db, key: i128, timestamp: i64) !void {
         // NOTE: WAL write is handled by Engine layer with group commits
         // Do not write to WAL here to avoid double-writing
@@ -338,8 +370,9 @@ pub const Db = struct {
     }
 
     pub fn shutdown(self: *Db) !void {
-        // Flush the current active memtable
-        self.memtable.lists.push(self.memtable.active) catch {};
+        // Switch active memtable to inactive list (replaces with fresh empty one)
+        // This ensures memtable.active always points to a valid skiplist for deinit
+        try self.memtable.switchActive();
 
         try self.flush();
     }

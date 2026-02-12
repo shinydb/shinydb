@@ -32,6 +32,8 @@ pub const Server = struct {
     security_manager: *SecurityManager,
     security_enabled: bool,
     active_connections: std.atomic.Value(u64),
+    shutdown_requested: std.atomic.Value(bool),
+    listener: ?*net.Server,
 
     const Self = @This();
 
@@ -81,6 +83,8 @@ pub const Server = struct {
             .security_manager = security_manager,
             .security_enabled = security_enabled,
             .active_connections = std.atomic.Value(u64).init(0),
+            .shutdown_requested = std.atomic.Value(bool).init(false),
+            .listener = null,
         };
     }
 
@@ -97,15 +101,23 @@ pub const Server = struct {
 
     pub fn run(self: *Self) !void {
         var listening = try self.address.listen(self.io, .{});
-        defer listening.close(self.io);
+        self.listener = &listening;
+        defer {
+            self.listener = null;
+            if (!self.shutdown_requested.load(.acquire)) {
+                listening.deinit(self.io);
+            }
+            // If shutdown_requested, fd was already closed by stop()
+        }
 
         log.info("Server listening on {s}:{d} (session pooling, direct threads)", .{
             self.config.address,
             self.config.port,
         });
 
-        while (true) {
+        while (!self.shutdown_requested.load(.acquire)) {
             const connection = listening.accept(self.io) catch |err| {
+                if (self.shutdown_requested.load(.acquire)) break;
                 log.err("Accept error: {}", .{err});
                 continue;
             };
@@ -126,6 +138,33 @@ pub const Server = struct {
             };
             thread.detach();
         }
+
+        log.info("Server accept loop exited, draining connections...", .{});
+
+        // Wait for active connections to drain (max 10 seconds)
+        var wait_count: u32 = 0;
+        while (self.active_connections.load(.acquire) > 0 and wait_count < 100) : (wait_count += 1) {
+            std.posix.nanosleep(0, 100_000_000); // 100ms
+        }
+
+        if (self.active_connections.load(.acquire) > 0) {
+            log.warn("Shutdown with {} connections still active", .{self.active_connections.load(.acquire)});
+        }
+
+        log.info("Server stopped", .{});
+    }
+
+    /// Graceful shutdown: signal accept loop to stop, close listener
+    pub fn stop(self: *Self) void {
+        log.info("Server stop requested", .{});
+
+        // 1. Signal the accept loop to stop
+        self.shutdown_requested.store(true, .release);
+
+        // 2. Close the listener socket fd to unblock accept()
+        if (self.listener) |l| {
+            std.posix.close(l.socket.handle);
+        }
     }
 
     /// Handle a single connection (runs on dedicated thread)
@@ -137,7 +176,7 @@ pub const Server = struct {
         defer _ = self.active_connections.fetchSub(1, .monotonic);
 
         // Get session from pool
-        var session = self.session_pool.acquire(connection, &self.message_buffer_pool) catch |err| {
+        var session = self.session_pool.acquire(connection, &self.message_buffer_pool, self) catch |err| {
             log.err("Failed to acquire session: {}", .{err});
             return;
         };
@@ -157,6 +196,7 @@ pub const Session = struct {
     io: Io,
     connection: net.Stream,
     engine: *Engine,
+    server: *Server,
     read_buffer: [64 * 1024]u8,
     write_buffer: [64 * 1024]u8,
     idle_timeout_ms: u64,
@@ -168,12 +208,13 @@ pub const Session = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: Allocator, io: Io, connection: net.Stream, engine: *Engine, idle_timeout_ms: u64, message_buffer_pool: ?*MessageBufferPool, security_manager: *SecurityManager) Self {
+    pub fn init(allocator: Allocator, io: Io, connection: net.Stream, engine: *Engine, server: *Server, idle_timeout_ms: u64, message_buffer_pool: ?*MessageBufferPool, security_manager: *SecurityManager) Self {
         return Self{
             .allocator = allocator,
             .io = io,
             .connection = connection,
             .engine = engine,
+            .server = server,
             .read_buffer = undefined,
             .write_buffer = undefined,
             .idle_timeout_ms = idle_timeout_ms,
@@ -192,8 +233,9 @@ pub const Session = struct {
     }
 
     /// Reset session with a new connection (for reuse in pool)
-    pub fn reset(self: *Self, connection: net.Stream) void {
+    pub fn reset(self: *Self, connection: net.Stream, server: *Server) void {
         self.connection = connection;
+        self.server = server;
         self.last_activity_ms = milliTimestamp();
         // Buffers are stack arrays, no need to reset
     }
@@ -746,7 +788,6 @@ pub const Session = struct {
                 break :blk Operation{ .Reply = .{ .status = .ok, .data = value } };
             },
             .Aggregate => |data| blk: {
-                // Route to aggregation handler
                 const result = try self.engine.aggregateDocs(data.store_ns, data.aggregate_json);
                 break :blk Operation{ .Reply = .{ .status = .ok, .data = result } };
             },
@@ -867,7 +908,7 @@ pub const Session = struct {
                 break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
             },
             .Shutdown => blk: {
-                try self.engine.shutdown();
+                self.server.stop();
                 break :blk Operation{ .Reply = .{ .status = .ok, .data = null } };
             },
         };

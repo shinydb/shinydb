@@ -86,7 +86,7 @@ pub const SlottedPage = struct {
     }
 
     pub fn headerPtr(self: anytype) *PageHeader {
-        return @alignCast(@ptrCast(self.data.ptr));
+        return @ptrCast(@alignCast(self.data.ptr));
     }
 
     pub fn freeSpace(self: *const SlottedPage) u16 {
@@ -562,7 +562,7 @@ pub const Iterator = struct {
 
             // If the new page is also empty, return null to avoid infinite recursion
             if (page.headerPtr().num_cells == 0) {
-                return null;  // Treat empty pages as end of iteration
+                return null; // Treat empty pages as end of iteration
             }
         }
 
@@ -727,6 +727,7 @@ const BPlusTree = struct {
     pool: *PagePool,
     root_page_id: PageId,
     allocator: Allocator,
+    parent_allocator: Allocator,
     arena: std.heap.ArenaAllocator,
 
     const BTreeError = error{ KeyNotFound, KeyAlreadyExists, TreeTooDeepOrCyclic };
@@ -736,6 +737,7 @@ const BPlusTree = struct {
 
         self.*.pool = pool;
         self.*.root_page_id = 0;
+        self.*.parent_allocator = allocator;
         self.*.arena = std.heap.ArenaAllocator.init(allocator);
         self.*.allocator = self.*.arena.allocator();
 
@@ -753,7 +755,7 @@ const BPlusTree = struct {
             // Write header to page 0
             // First, zero out the header area to avoid leftover PageHeader data
             @memset(header_page_frame.page.?.data[0..@sizeOf(Header)], 0);
-            const header: *Header = @alignCast(@ptrCast(header_page_frame.page.?.data.ptr));
+            const header: *Header = @ptrCast(@alignCast(header_page_frame.page.?.data.ptr));
             header.root_page_id = root_id;
             header.magic = MAGIC;
             header.version = VERSION;
@@ -768,7 +770,7 @@ const BPlusTree = struct {
             const header_page_frame = try self.pool.fetchPage(0);
             defer self.pool.unpinPage(0, false);
 
-            const header: *Header = @alignCast(@ptrCast(header_page_frame.page.?.data.ptr));
+            const header: *Header = @ptrCast(@alignCast(header_page_frame.page.?.data.ptr));
             self.root_page_id = header.root_page_id;
         }
 
@@ -778,15 +780,16 @@ const BPlusTree = struct {
     pub fn deinit(self: *BPlusTree) void {
         self.shutdown() catch {};
         self.pool.deinit() catch {};
-        self.allocator.destroy(self);
+        const parent = self.parent_allocator;
         self.arena.deinit();
+        parent.destroy(self);
     }
 
     pub fn shutdown(self: *BPlusTree) !void {
         const header_page_frame = try self.pool.fetchPage(0);
         defer self.pool.unpinPage(0, true);
 
-        const header: *Header = @alignCast(@ptrCast(header_page_frame.page.?.data.ptr));
+        const header: *Header = @ptrCast(@alignCast(header_page_frame.page.?.data.ptr));
         header.root_page_id = self.root_page_id;
     }
 

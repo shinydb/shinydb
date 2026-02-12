@@ -66,8 +66,8 @@ pub const Catalog = struct {
         const system_space = try self.allocator.create(Space);
         system_space.* = Space{
             .id = 0,
-            .ns = "system",
-            .description = "System namespace for metadata",
+            .ns = try self.allocator.dupe(u8, "system"),
+            .description = try self.allocator.dupe(u8, "System namespace for metadata"),
             .created_at = milliTimestamp(),
         };
         try self.spaces.put(system_space.ns, system_space);
@@ -104,13 +104,18 @@ pub const Catalog = struct {
 
         // Load spaces
         for (doc.spaces) |space_data| {
-            if (self.spaces.contains(space_data.ns)) continue;
+            if (self.spaces.contains(space_data.ns)) {
+                // Free BSON-decoded strings we won't use
+                self.allocator.free(@constCast(space_data.ns));
+                if (space_data.description) |d| self.allocator.free(@constCast(d));
+                continue;
+            }
 
             const space = try self.allocator.create(Space);
             space.* = Space{
                 .id = space_data.id,
-                .ns = try self.allocator.dupe(u8, space_data.ns),
-                .description = if (space_data.description) |d| try self.allocator.dupe(u8, d) else null,
+                .ns = space_data.ns,
+                .description = space_data.description,
                 .created_at = space_data.created_at,
             };
             try self.spaces.put(space.ns, space);
@@ -118,14 +123,18 @@ pub const Catalog = struct {
 
         // Load stores
         for (doc.stores) |store_data| {
-            if (self.stores.contains(store_data.ns)) continue;
+            if (self.stores.contains(store_data.ns)) {
+                self.allocator.free(@constCast(store_data.ns));
+                if (store_data.description) |d| self.allocator.free(@constCast(d));
+                continue;
+            }
 
             const store = try self.allocator.create(Store);
             store.* = Store{
                 .id = store_data.id,
                 .store_id = store_data.store_id,
-                .ns = try self.allocator.dupe(u8, store_data.ns),
-                .description = if (store_data.description) |d| try self.allocator.dupe(u8, d) else null,
+                .ns = store_data.ns,
+                .description = store_data.description,
                 .created_at = store_data.created_at,
             };
             try self.stores.put(store.ns, store);
@@ -134,17 +143,22 @@ pub const Catalog = struct {
 
         // Load indexes
         for (doc.indexes) |index_data| {
-            if (self.indexes.contains(index_data.ns)) continue;
+            if (self.indexes.contains(index_data.ns)) {
+                self.allocator.free(@constCast(index_data.ns));
+                self.allocator.free(@constCast(index_data.field));
+                if (index_data.description) |d| self.allocator.free(@constCast(d));
+                continue;
+            }
 
             const index = try self.allocator.create(Index);
             index.* = Index{
                 .id = index_data.id,
                 .store_id = index_data.store_id,
-                .ns = try self.allocator.dupe(u8, index_data.ns),
-                .field = try self.allocator.dupe(u8, index_data.field),
+                .ns = index_data.ns,
+                .field = index_data.field,
                 .unique = index_data.unique,
                 .field_type = index_data.field_type,
-                .description = if (index_data.description) |d| try self.allocator.dupe(u8, d) else null,
+                .description = index_data.description,
                 .created_at = index_data.created_at,
             };
             try self.indexes.put(index.ns, index);
@@ -158,13 +172,17 @@ pub const Catalog = struct {
 
         // Load users
         for (doc.users) |user_data| {
-            if (self.users.contains(user_data.username)) continue;
+            if (self.users.contains(user_data.username)) {
+                self.allocator.free(@constCast(user_data.username));
+                self.allocator.free(@constCast(user_data.password_hash));
+                continue;
+            }
 
             const user = try self.allocator.create(User);
             user.* = User{
                 .id = user_data.id,
-                .username = try self.allocator.dupe(u8, user_data.username),
-                .password_hash = try self.allocator.dupe(u8, user_data.password_hash),
+                .username = user_data.username,
+                .password_hash = user_data.password_hash,
                 .role = user_data.role,
                 .created_at = user_data.created_at,
             };
@@ -173,16 +191,21 @@ pub const Catalog = struct {
 
         // Load backups
         for (doc.backups) |backup_data| {
-            if (self.backups.contains(backup_data.name)) continue;
+            if (self.backups.contains(backup_data.name)) {
+                self.allocator.free(@constCast(backup_data.name));
+                self.allocator.free(@constCast(backup_data.backup_path));
+                if (backup_data.description) |d| self.allocator.free(@constCast(d));
+                continue;
+            }
 
             const backup = try self.allocator.create(Backup);
             backup.* = Backup{
                 .id = backup_data.id,
-                .name = try self.allocator.dupe(u8, backup_data.name),
-                .backup_path = try self.allocator.dupe(u8, backup_data.backup_path),
+                .name = backup_data.name,
+                .backup_path = backup_data.backup_path,
                 .size_bytes = backup_data.size_bytes,
                 .created_at = backup_data.created_at,
-                .description = if (backup_data.description) |d| try self.allocator.dupe(u8, d) else null,
+                .description = backup_data.description,
             };
             try self.backups.put(backup.name, backup);
         }

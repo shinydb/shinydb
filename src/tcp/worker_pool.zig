@@ -203,20 +203,20 @@ pub const SessionPool = struct {
     }
 
     /// Acquire a session from the pool (creates new if pool is empty)
-    pub fn acquire(self: *Self, connection: net.Stream, message_buffer_pool: *MessageBufferPool) !*Session {
+    pub fn acquire(self: *Self, connection: net.Stream, message_buffer_pool: *MessageBufferPool, server: anytype) !*Session {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.pool.items.len > 0) {
             const session = self.pool.pop().?; // Force unwrap since we checked length
             // Reuse existing session with new connection
-            session.reset(connection);
+            session.reset(connection, server);
             return session;
         }
 
         // Create new session if pool is empty
         const session = try self.allocator.create(Session);
-        session.* = Session.init(self.allocator, self.io, connection, self.engine, self.idle_timeout_ms, message_buffer_pool, self.security_manager);
+        session.* = Session.init(self.allocator, self.io, connection, self.engine, server, self.idle_timeout_ms, message_buffer_pool, self.security_manager);
         return session;
     }
 

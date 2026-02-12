@@ -31,7 +31,7 @@ pub const Engine = struct {
     io: Io,
     db: *Db,
     wal: ?*WriteAheadLog,
-    primary_index: Index(u128, u64),
+    primary_index: *Index(u128, u64),
     keygen: KeyGen,
     catalog: *Catalog,
 
@@ -140,7 +140,7 @@ pub const Engine = struct {
             .io = io,
             .db = db,
             .wal = wal,
-            .primary_index = primary_index_ptr.*,
+            .primary_index = primary_index_ptr,
             .keygen = keygen,
             .catalog = db.catalog,
             .db_mutex = .{},
@@ -161,6 +161,7 @@ pub const Engine = struct {
         }
         // Note: catalog is owned by db, db.deinit() will free it
         self.primary_index.deinit();
+        self.allocator.destroy(self.primary_index);
         if (self.wal) |wal| wal.deinit() catch {};
         self.db.deinit();
         self.allocator.destroy(self);
@@ -988,9 +989,12 @@ pub const Engine = struct {
                 // Skip if already seen from memtable
                 if (seen_keys.contains(key)) continue;
 
-                // Fetch document (will check memtable first, then vlog)
+                // Read vlog offset directly from cell value (avoids re-searching the index)
+                const vlog_offset = std.mem.readInt(u64, cell.value[0..@sizeOf(u64)], .little);
+
+                // Fetch document using known offset
                 self.db_mutex.lock();
-                const value = self.db.get(@bitCast(key)) catch |err| {
+                const value = self.db.getByOffset(@bitCast(key), vlog_offset) catch |err| {
                     self.db_mutex.unlock();
                     log.warn("Failed to read key={x}: {}", .{ key, err });
                     continue;
@@ -1137,7 +1141,9 @@ pub const Engine = struct {
         const GroupAccumulator = query_engine.GroupAccumulator;
 
         // Parse JSON query
-        var parsed = try query_engine.parseJsonQuery(self.allocator, query_json);
+        var parsed = query_engine.parseJsonQuery(self.allocator, query_json) catch |err| {
+            return err;
+        };
         defer parsed.deinit();
 
         // Resolve store_ns to store_id
@@ -1188,13 +1194,14 @@ pub const Engine = struct {
                 if (!matches) return;
 
                 // Compute group key
-                const group_key = try self_ptr.computeGroupKey(value, p.group_by_fields, ext);
+                const group_key = self_ptr.computeGroupKey(value, p.group_by_fields, ext) catch |err| {
+                    return err;
+                };
                 defer allocator.free(group_key);
 
                 // Get or create group accumulator
                 const gop = try g.getOrPut(group_key);
                 if (!gop.found_existing) {
-                    // Always dupe the key for the hash map since group_key is always freed by defer
                     gop.key_ptr.* = try allocator.dupe(u8, group_key);
                     gop.value_ptr.* = GroupAccumulator.init(allocator);
                 }
@@ -1202,19 +1209,47 @@ pub const Engine = struct {
                 // Accumulate each aggregation
                 for (p.aggregations.items) |agg| {
                     const field_value: ?FieldValue = if (agg.field_name) |fn_name| blk: {
-                        if (try ext.extractI64(value, fn_name)) |i| {
-                            break :blk FieldValue{ .i64_val = i };
-                        }
-                        if (try ext.extractF64(value, fn_name)) |f| {
-                            break :blk FieldValue{ .f64_val = f };
-                        }
-                        if (try ext.extractU64(value, fn_name)) |u| {
-                            break :blk FieldValue{ .u64_val = u };
-                        }
+                        // Try i64 extraction first
+                        if (ext.extractI64(value, fn_name)) |opt_i64| {
+                            if (opt_i64) |i| {
+                                break :blk FieldValue{ .i64_val = i };
+                            }
+                        } else |_| {}
+
+                        // Try f64 extraction
+                        if (ext.extractF64(value, fn_name)) |opt_f64| {
+                            if (opt_f64) |f| {
+                                break :blk FieldValue{ .f64_val = f };
+                            }
+                        } else |_| {}
+
+                        // Try u64 extraction
+                        if (ext.extractU64(value, fn_name)) |opt_u64| {
+                            if (opt_u64) |u| {
+                                break :blk FieldValue{ .u64_val = u };
+                            }
+                        } else |_| {}
+
+                        // Try string extraction and parse as number
+                        if (ext.extractString(value, fn_name)) |opt_str| {
+                            if (opt_str) |str| {
+                                defer allocator.free(str);
+                                if (std.fmt.parseFloat(f64, str)) |parsed_float| {
+                                    break :blk FieldValue{ .f64_val = parsed_float };
+                                } else |_| {
+                                    if (std.fmt.parseInt(i64, str, 10)) |parsed_int| {
+                                        break :blk FieldValue{ .i64_val = parsed_int };
+                                    } else |_| {}
+                                }
+                            }
+                        } else |_| {}
+
                         break :blk null;
                     } else null;
 
-                    try gop.value_ptr.update(agg.name, agg.function, field_value);
+                    gop.value_ptr.update(agg.name, agg.function, field_value) catch |err| {
+                        return err;
+                    };
                 }
             }
         }.process;
@@ -1266,8 +1301,11 @@ pub const Engine = struct {
                 if (key_store_id != store_id) continue;
                 if (seen_keys.contains(key)) continue;
 
+                // Read vlog offset directly from the cell value (avoids re-searching the index)
+                const offset = std.mem.readInt(u64, cell.value[0..@sizeOf(u64)], .little);
+
                 self.db_mutex.lock();
-                const value = self.db.get(@bitCast(key)) catch {
+                const value = self.db.getByOffset(@bitCast(key), offset) catch {
                     self.db_mutex.unlock();
                     continue;
                 };
@@ -1278,8 +1316,8 @@ pub const Engine = struct {
             }
         }
 
-        // Build JSON result
-        return try self.aggregateResultsToJson(&groups, &parsed);
+        // Build BSON result
+        return try self.aggregateResultsToBson(&groups, &parsed);
     }
 
     /// Compute a group key from document based on group_by fields
@@ -1292,129 +1330,228 @@ pub const Engine = struct {
         for (fields, 0..) |field, i| {
             if (i > 0) try key_parts.append(self.allocator, '|');
 
-            // Try to extract field value
-            if (try extractor.extractString(doc_json, field)) |val| {
-                defer self.allocator.free(val);
-                try key_parts.appendSlice(self.allocator, val);
-            } else if (try extractor.extractI64(doc_json, field)) |val| {
-                var buf: [32]u8 = undefined;
-                const formatted = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
-                try key_parts.appendSlice(self.allocator, formatted);
-            } else if (try extractor.extractF64(doc_json, field)) |val| {
-                var buf: [64]u8 = undefined;
-                const formatted = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
-                try key_parts.appendSlice(self.allocator, formatted);
-            } else {
-                try key_parts.appendSlice(self.allocator, "null");
+            // Try to extract field value - handle TypeMismatch gracefully
+            if (extractor.extractString(doc_json, field)) |opt_val| {
+                if (opt_val) |val| {
+                    defer self.allocator.free(val);
+                    try key_parts.appendSlice(self.allocator, val);
+                } else {
+                    // Field exists but is null, try other types
+                    if (extractor.extractI64(doc_json, field)) |opt_i64| {
+                        if (opt_i64) |val| {
+                            var buf: [32]u8 = undefined;
+                            const formatted = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
+                            try key_parts.appendSlice(self.allocator, formatted);
+                        } else {
+                            try key_parts.appendSlice(self.allocator, "null");
+                        }
+                    } else |_| {
+                        try key_parts.appendSlice(self.allocator, "null");
+                    }
+                }
+            } else |err| switch (err) {
+                error.TypeMismatch => {
+                    // Try i64 extraction
+                    if (extractor.extractI64(doc_json, field)) |opt_val| {
+                        if (opt_val) |val| {
+                            var buf: [32]u8 = undefined;
+                            const formatted = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
+                            try key_parts.appendSlice(self.allocator, formatted);
+                        } else {
+                            try key_parts.appendSlice(self.allocator, "null");
+                        }
+                    } else |i64_err| switch (i64_err) {
+                        error.TypeMismatch => {
+                            // Try f64 extraction
+                            if (extractor.extractF64(doc_json, field)) |opt_val| {
+                                if (opt_val) |val| {
+                                    var buf: [64]u8 = undefined;
+                                    const formatted = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
+                                    try key_parts.appendSlice(self.allocator, formatted);
+                                } else {
+                                    try key_parts.appendSlice(self.allocator, "null");
+                                }
+                            } else |f64_err| switch (f64_err) {
+                                error.TypeMismatch => {
+                                    try key_parts.appendSlice(self.allocator, "null");
+                                },
+                                else => return f64_err,
+                            }
+                        },
+                        else => return i64_err,
+                    }
+                },
+                else => return err,
             }
         }
 
         return try key_parts.toOwnedSlice(self.allocator);
     }
 
-    /// Convert aggregation results to JSON
-    fn aggregateResultsToJson(self: *Self, groups: *std.StringHashMap(@import("../storage/query_engine.zig").GroupAccumulator), parsed: *const @import("../storage/query_engine.zig").ParsedQuery) ![]u8 {
-        var result: std.ArrayList(u8) = .empty;
-        errdefer result.deinit(self.allocator);
+    /// Convert aggregation results to BSON
+    /// Output format: a BSON document with "groups" array and "total_groups" count
+    /// Each group element is a BSON document with "key" (document) and "values" (document)
+    fn aggregateResultsToBson(self: *Self, groups: *std.StringHashMap(@import("../storage/query_engine.zig").GroupAccumulator), parsed: *const @import("../storage/query_engine.zig").ParsedQuery) ![]u8 {
+        const GroupAccumulator = @import("../storage/query_engine.zig").GroupAccumulator;
+        const AggregateResult = @import("../storage/query_engine.zig").AggregateResult;
 
-        try result.appendSlice(self.allocator, "{\"groups\":[");
+        // Collect entries into a sortable array
+        const GroupEntry = struct { key: []const u8, acc: *GroupAccumulator };
+        var entries: std.ArrayList(GroupEntry) = .empty;
+        defer entries.deinit(self.allocator);
 
-        var first_group = true;
-        var group_it = groups.iterator();
-        while (group_it.next()) |entry| {
-            if (!first_group) try result.append(self.allocator, ',');
-            first_group = false;
-
-            try result.appendSlice(self.allocator, "{\"key\":");
-
-            // Format group key
-            if (parsed.group_by_fields) |fields| {
-                try result.append(self.allocator, '{');
-                var key_parts = std.mem.splitSequence(u8, entry.key_ptr.*, "|");
-                var first_key = true;
-                for (fields) |field| {
-                    if (!first_key) try result.append(self.allocator, ',');
-                    first_key = false;
-
-                    try result.append(self.allocator, '"');
-                    try result.appendSlice(self.allocator, field);
-                    try result.appendSlice(self.allocator, "\":\"");
-                    if (key_parts.next()) |part| {
-                        try result.appendSlice(self.allocator, part);
-                    }
-                    try result.append(self.allocator, '"');
-                }
-                try result.append(self.allocator, '}');
-            } else {
-                try result.appendSlice(self.allocator, "null");
-            }
-
-            try result.appendSlice(self.allocator, ",\"values\":{");
-
-            // Format aggregated values
-            var first_val = true;
-            for (parsed.aggregations.items) |agg| {
-                if (!first_val) try result.append(self.allocator, ',');
-                first_val = false;
-
-                try result.append(self.allocator, '"');
-                try result.appendSlice(self.allocator, agg.name);
-                try result.appendSlice(self.allocator, "\":");
-
-                if (entry.value_ptr.getResult(agg.name)) |agg_result| {
-                    var buf: [64]u8 = undefined;
-                    switch (agg_result) {
-                        .int => |v| {
-                            const formatted = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "0";
-                            try result.appendSlice(self.allocator, formatted);
-                        },
-                        .float => |v| {
-                            const formatted = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "0";
-                            try result.appendSlice(self.allocator, formatted);
-                        },
-                        .string => |v| {
-                            try result.append(self.allocator, '"');
-                            try result.appendSlice(self.allocator, v);
-                            try result.append(self.allocator, '"');
-                        },
-                    }
-                } else {
-                    try result.appendSlice(self.allocator, "null");
-                }
-            }
-
-            try result.appendSlice(self.allocator, "}}");
+        var collect_it = groups.iterator();
+        while (collect_it.next()) |entry| {
+            try entries.append(self.allocator, .{ .key = entry.key_ptr.*, .acc = entry.value_ptr });
         }
 
-        try result.appendSlice(self.allocator, "],\"total_groups\":");
-        var count_buf: [16]u8 = undefined;
-        const count_formatted = std.fmt.bufPrint(&count_buf, "{d}", .{groups.count()}) catch "0";
-        try result.appendSlice(self.allocator, count_formatted);
-        try result.append(self.allocator, '}');
+        // Sort if orderBy is specified
+        if (parsed.sort_field) |sort_field| {
+            const asc = parsed.sort_ascending;
 
-        return try result.toOwnedSlice(self.allocator);
+            // Determine if sort field is a group-by key or an aggregate result
+            var sort_key_index: ?usize = null;
+            if (parsed.group_by_fields) |fields| {
+                for (fields, 0..) |field, idx| {
+                    if (std.mem.eql(u8, field, sort_field)) {
+                        sort_key_index = idx;
+                        break;
+                    }
+                }
+            }
+
+            const SortCtx = struct {
+                key_index: ?usize,
+                agg_name: []const u8,
+                ascending: bool,
+
+                fn lessThan(ctx: @This(), a: GroupEntry, b: GroupEntry) bool {
+                    if (ctx.key_index) |ki| {
+                        // Sort by group-by key part
+                        const a_part = getKeyPart(a.key, ki);
+                        const b_part = getKeyPart(b.key, ki);
+
+                        // Try numeric comparison first
+                        const a_num = std.fmt.parseFloat(f64, a_part) catch null;
+                        const b_num = std.fmt.parseFloat(f64, b_part) catch null;
+
+                        if (a_num != null and b_num != null) {
+                            return if (ctx.ascending) a_num.? < b_num.? else a_num.? > b_num.?;
+                        }
+
+                        // Fall back to string comparison
+                        const order = std.mem.order(u8, a_part, b_part);
+                        return if (ctx.ascending) order == .lt else order == .gt;
+                    } else {
+                        // Sort by aggregate result value
+                        const a_result: ?AggregateResult = a.acc.getResult(ctx.agg_name);
+                        const b_result: ?AggregateResult = b.acc.getResult(ctx.agg_name);
+
+                        const a_val = resultToF64(a_result);
+                        const b_val = resultToF64(b_result);
+
+                        return if (ctx.ascending) a_val < b_val else a_val > b_val;
+                    }
+                }
+
+                fn getKeyPart(key: []const u8, index: usize) []const u8 {
+                    var parts = std.mem.splitSequence(u8, key, "|");
+                    var i: usize = 0;
+                    while (parts.next()) |part| {
+                        if (i == index) return part;
+                        i += 1;
+                    }
+                    return key;
+                }
+
+                fn resultToF64(result: ?AggregateResult) f64 {
+                    if (result) |r| {
+                        return switch (r) {
+                            .int => |v| @floatFromInt(v),
+                            .float => |v| v,
+                            .string => 0.0,
+                        };
+                    }
+                    return 0.0;
+                }
+            };
+
+            std.sort.insertion(GroupEntry, entries.items, SortCtx{
+                .key_index = sort_key_index,
+                .agg_name = sort_field,
+                .ascending = asc,
+            }, SortCtx.lessThan);
+        }
+
+        // Build array of group BSON documents
+        var arr_doc = bson.BsonDocument.empty(self.allocator);
+        defer arr_doc.deinit();
+
+        for (entries.items, 0..) |entry, group_idx| {
+            // Build "key" sub-document
+            var key_doc = bson.BsonDocument.empty(self.allocator);
+            defer key_doc.deinit();
+
+            if (parsed.group_by_fields) |fields| {
+                var key_parts = std.mem.splitSequence(u8, entry.key, "|");
+                for (fields) |field| {
+                    if (key_parts.next()) |part| {
+                        try key_doc.putString(field, part);
+                    }
+                }
+            }
+
+            // Build "values" sub-document
+            var values_doc = bson.BsonDocument.empty(self.allocator);
+            defer values_doc.deinit();
+
+            for (parsed.aggregations.items) |agg| {
+                if (entry.acc.getResult(agg.name)) |agg_result| {
+                    switch (agg_result) {
+                        .int => |v| try values_doc.putInt64(agg.name, v),
+                        .float => |v| try values_doc.putDouble(agg.name, v),
+                        .string => |v| try values_doc.putString(agg.name, v),
+                    }
+                } else {
+                    try values_doc.putNull(agg.name);
+                }
+            }
+
+            // Build group element: { "key": {...}, "values": {...} }
+            var group_doc = bson.BsonDocument.empty(self.allocator);
+            defer group_doc.deinit();
+
+            if (parsed.group_by_fields != null) {
+                try group_doc.putDocument("key", key_doc);
+            } else {
+                try group_doc.putNull("key");
+            }
+            try group_doc.putDocument("values", values_doc);
+
+            // Array elements use string index keys: "0", "1", etc.
+            var idx_buf: [16]u8 = undefined;
+            const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{group_idx}) catch "0";
+            try arr_doc.put(idx_str, .{ .document = group_doc });
+        }
+
+        // Build root document: { "groups": [...], "total_groups": N }
+        var root_doc = bson.BsonDocument.empty(self.allocator);
+        defer root_doc.deinit();
+
+        try root_doc.putArray("groups", bson.BsonArray.init(self.allocator, arr_doc.toBytes()));
+        try root_doc.putInt32("total_groups", @intCast(groups.count()));
+
+        // Return owned copy of BSON bytes
+        return try self.allocator.dupe(u8, root_doc.toBytes());
     }
 
     /// Graceful shutdown
     pub fn shutdown(self: *Self) !void {
         log.info("Shutting down engine...", .{});
 
-        // Flush all data
-        try self.flush();
-
-        // Shutdown database
-        {
-            self.db_mutex.lock();
-            defer self.db_mutex.unlock();
-            try self.db.shutdown();
-        }
-
-        // Checkpoint WAL
-        if (self.wal) |wal| {
-            self.wal_mutex.lock();
-            defer self.wal_mutex.unlock();
-            try wal.checkpoint();
-        }
+        self.db_mutex.lock();
+        defer self.db_mutex.unlock();
+        try self.db.shutdown();
 
         log.info("Engine shutdown complete", .{});
     }

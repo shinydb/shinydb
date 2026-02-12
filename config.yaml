@@ -2,7 +2,7 @@ address: "127.0.0.1"
 port: 23469
 max_sessions: 128
 worker_count: 4
-base_dir: /tmp/shinydb/data
+base_dir: /usr/local/shinydb/data
 max_cores: 4
 connection_pool:
   max_queue_size: 1000
@@ -25,10 +25,10 @@ file_sizes:
   vlog: 1073741824
   wal: 16777216
 paths:
-  vlog: /tmp/shinydb/data/logs
-  wal: /tmp/shinydb/data/wals
-  index: /tmp/shinydb/data/indexes
-  metadata: /tmp/shinydb/data
+  vlog: /usr/local/shinydb/data/logs
+  wal: /usr/local/shinydb/data/wals
+  index: /usr/local/shinydb/data/indexes
+  metadata: /usr/local/shinydb/data
 gc_config:
   enabled: true
   interval_seconds: 300
