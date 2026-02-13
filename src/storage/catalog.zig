@@ -31,6 +31,7 @@ pub const Catalog = struct {
     spaces: std.StringHashMap(*Space),
     stores: std.StringHashMap(*Store),
     stores_by_id: std.AutoHashMap(u16, *Store),
+    next_store_id: u16 = USER_STORE_START_ID,
     indexes: std.StringHashMap(*Index),
     indexes_by_store: std.AutoHashMap(u16, std.ArrayList(*Index)),
     users: std.StringHashMap(*User),
@@ -139,6 +140,11 @@ pub const Catalog = struct {
             };
             try self.stores.put(store.ns, store);
             try self.stores_by_id.put(store.store_id, store);
+
+            // Track max store_id for monotonic counter
+            if (store.store_id >= self.next_store_id) {
+                self.next_store_id = store.store_id + 1;
+            }
         }
 
         // Load indexes
@@ -378,15 +384,9 @@ pub const Catalog = struct {
         const desc_owned = if (description) |d| try self.allocator.dupe(u8, d) else null;
         errdefer if (desc_owned) |d| self.allocator.free(d);
 
-        // Find max store_id and increment (user stores start at 101)
-        var max_store_id: u16 = USER_STORE_START_ID - 1;
-        var store_iter = self.stores_by_id.iterator();
-        while (store_iter.next()) |entry| {
-            if (entry.key_ptr.* > max_store_id) {
-                max_store_id = entry.key_ptr.*;
-            }
-        }
-        const store_id: u16 = max_store_id + 1;
+        // Use monotonic counter for store_id assignment
+        const store_id: u16 = self.next_store_id;
+        self.next_store_id += 1;
 
         const store = try self.allocator.create(Store);
         store.* = Store{
