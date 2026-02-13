@@ -1597,25 +1597,11 @@ fn matchesPredicate(doc_bson: []const u8, pred: query_engine.Predicate) bool {
         var mutable_doc = doc;
         defer mutable_doc.deinit();
 
-        // Handle $exists operator specially — checks field presence, not value
-        if (pred.operator == .exists) {
-            const field_exists = blk: {
-                if (doc.getNestedField(pred.field_name)) |field_value_opt| {
-                    break :blk field_value_opt != null;
-                } else |_| {
-                    break :blk false;
-                }
-            };
-            // pred.value.bool_val: true = field must exist, false = field must not exist
-            const want_exists = if (pred.value == .bool_val) pred.value.bool_val else true;
-            return field_exists == want_exists;
-        }
-
         // Try to get the field value from BSON (supports nested dot-notation)
         if (doc.getNestedField(pred.field_name)) |field_value_opt| {
             if (field_value_opt) |field_value| {
                 // Compare BSON value with predicate value
-                return compareBsonValue(field_value, pred.value, pred.operator, pred);
+                return compareBsonValue(field_value, pred.value, pred.operator);
             }
         } else |_| {
             // Field not found or error reading it
@@ -1658,25 +1644,7 @@ fn matchesAllPredicates(doc_bson: []const u8, parsed: *const query_engine.Parsed
 const QueryOperator = query_engine.Operator;
 
 /// Compare a BSON Value with a FieldValue using an operator
-fn compareBsonValue(bson_val: bson.Value, field_val: FieldValue, op: QueryOperator, pred: query_engine.Predicate) bool {
-    // Handle $in operator — check if BSON value matches any value in the list
-    if (op == .in) {
-        const in_vals = pred.in_values orelse return false;
-        for (in_vals) |v| {
-            if (compareBsonValue(bson_val, v, .eq, pred)) return true;
-        }
-        return false;
-    }
-
-    // Handle $regex operator — match BSON string against pattern
-    if (op == .regex) {
-        const pattern = pred.regex_pattern orelse return false;
-        return switch (bson_val) {
-            .string => |s| query_engine.simpleRegexMatch(s, pattern),
-            else => false,
-        };
-    }
-
+fn compareBsonValue(bson_val: bson.Value, field_val: FieldValue, op: QueryOperator) bool {
     return switch (bson_val) {
         .string => |s| blk: {
             if (field_val == .string) {

@@ -13,8 +13,6 @@ pub const Operator = enum {
     contains, // String contains
     starts_with, // String starts with
     in, // Value in list
-    exists, // Field exists
-    regex, // Regex match
 };
 
 /// Query predicate
@@ -22,8 +20,6 @@ pub const Predicate = struct {
     field_name: []const u8,
     operator: Operator,
     value: FieldValue,
-    in_values: ?[]FieldValue = null, // For $in operator: list of values to match against
-    regex_pattern: ?[]const u8 = null, // For $regex operator: pattern string
 
     pub fn evaluate(self: *const Predicate, field_value: FieldValue) bool {
         return switch (self.operator) {
@@ -36,8 +32,6 @@ pub const Predicate = struct {
             .contains => self.evaluateContains(field_value),
             .starts_with => self.evaluateStartsWith(field_value),
             .in => self.evaluateIn(field_value),
-            .exists => true, // exists is checked at the field-access level, not value level
-            .regex => self.evaluateRegex(field_value),
         };
     }
 
@@ -135,64 +129,13 @@ pub const Predicate = struct {
     }
 
     fn evaluateIn(self: *const Predicate, field_value: FieldValue) bool {
-        const vals = self.in_values orelse return false;
-        for (vals) |v| {
-            const matches = switch (v) {
-                .string => |s| switch (field_value) {
-                    .string => |actual| std.mem.eql(u8, s, actual),
-                    else => false,
-                },
-                .i64_val => |expected| switch (field_value) {
-                    .i64_val => |actual| expected == actual,
-                    .i32_val => |actual| expected == @as(i64, actual),
-                    .u64_val => |actual| expected >= 0 and @as(u64, @intCast(expected)) == actual,
-                    else => false,
-                },
-                .f64_val => |expected| switch (field_value) {
-                    .f64_val => |actual| expected == actual,
-                    else => false,
-                },
-                .bool_val => |expected| switch (field_value) {
-                    .bool_val => |actual| expected == actual,
-                    else => false,
-                },
-                else => false,
-            };
-            if (matches) return true;
-        }
+        // For IN operator, value should contain a list
+        // Simplified implementation
+        _ = self;
+        _ = field_value;
         return false;
     }
-
-    fn evaluateRegex(self: *const Predicate, field_value: FieldValue) bool {
-        const pattern = self.regex_pattern orelse return false;
-        const actual = switch (field_value) {
-            .string => |s| s,
-            else => return false,
-        };
-        return simpleRegexMatch(actual, pattern);
-    }
 };
-
-/// Simple regex match supporting ^anchored, $anchored, and literal substring
-/// Handles: "^prefix", "suffix$", "^exact$", and "substring"
-pub fn simpleRegexMatch(haystack: []const u8, pattern: []const u8) bool {
-    if (pattern.len == 0) return true;
-    const starts_anchor = pattern[0] == '^';
-    const ends_anchor = pattern[pattern.len - 1] == '$';
-    var core = pattern;
-    if (starts_anchor) core = core[1..];
-    if (ends_anchor and core.len > 0) core = core[0 .. core.len - 1];
-
-    if (starts_anchor and ends_anchor) {
-        return std.mem.eql(u8, haystack, core);
-    } else if (starts_anchor) {
-        return std.mem.startsWith(u8, haystack, core);
-    } else if (ends_anchor) {
-        return std.mem.endsWith(u8, haystack, core);
-    } else {
-        return std.mem.indexOf(u8, haystack, core) != null;
-    }
-}
 
 /// Query logical operator
 pub const LogicalOperator = enum {
@@ -576,15 +519,21 @@ pub const ParsedQuery = struct {
     }
 
     pub fn deinit(self: *ParsedQuery) void {
-        // Clean up predicates (field names, string values, in_values were allocated)
+        // Clean up predicates (field names and string values were allocated)
         for (self.predicates.items) |pred| {
-            self.freePredicate(pred);
+            self.allocator.free(pred.field_name);
+            if (pred.value == .string) {
+                self.allocator.free(pred.value.string);
+            }
         }
         self.predicates.deinit(self.allocator);
         // Clean up OR predicate groups
         for (self.or_predicates.items) |*group| {
             for (group.items) |pred| {
-                self.freePredicate(pred);
+                self.allocator.free(pred.field_name);
+                if (pred.value == .string) {
+                    self.allocator.free(pred.value.string);
+                }
             }
             group.deinit(self.allocator);
         }
@@ -618,27 +567,6 @@ pub const ParsedQuery = struct {
                 self.allocator.free(f);
             }
             self.allocator.free(fields);
-        }
-    }
-
-    fn freePredicate(self: *const ParsedQuery, pred: Predicate) void {
-        self.allocator.free(pred.field_name);
-        // regex_pattern shares memory with value.string, so don't double-free
-        if (pred.operator != .regex) {
-            if (pred.value == .string) {
-                self.allocator.free(pred.value.string);
-            }
-        } else {
-            // For regex, value.string IS the regex_pattern, free once
-            if (pred.regex_pattern) |rp| {
-                self.allocator.free(rp);
-            }
-        }
-        if (pred.in_values) |vals| {
-            for (vals) |v| {
-                if (v == .string) self.allocator.free(v.string);
-            }
-            self.allocator.free(vals);
         }
     }
 
@@ -766,8 +694,8 @@ pub fn parseJsonQuery(allocator: Allocator, json_str: []const u8) !ParsedQuery {
             }
         }
     } else if (root.object.get("orderBy")) |ob_val| {
+        // Client sends: "orderBy":{"field":"ListPrice","direction":"asc"}
         if (ob_val == .object) {
-            // Single field: "orderBy":{"field":"ListPrice","direction":"asc"}
             if (ob_val.object.get("field")) |field_val| {
                 if (field_val == .string) {
                     query.sort_field = try allocator.dupe(u8, field_val.string);
@@ -776,30 +704,7 @@ pub fn parseJsonQuery(allocator: Allocator, json_str: []const u8) !ParsedQuery {
                             query.sort_ascending = !std.mem.eql(u8, dir_val.string, "desc");
                         }
                     }
-                    try query.sort_fields.append(allocator, .{
-                        .field = try allocator.dupe(u8, field_val.string),
-                        .ascending = query.sort_ascending,
-                    });
                 }
-            }
-        } else if (ob_val == .array) {
-            // Multi-field: "orderBy":[{"field":"EmpID","direction":"asc"},{"field":"TotalDue","direction":"desc"}]
-            for (ob_val.array.items, 0..) |item, idx| {
-                if (item != .object) continue;
-                const field_val = item.object.get("field") orelse continue;
-                if (field_val != .string) continue;
-                const dir_str = if (item.object.get("direction")) |d| (if (d == .string) d.string else "asc") else "asc";
-                const asc = !std.mem.eql(u8, dir_str, "desc");
-
-                if (idx == 0) {
-                    // First field also sets sort_field for backward compat
-                    query.sort_field = try allocator.dupe(u8, field_val.string);
-                    query.sort_ascending = asc;
-                }
-                try query.sort_fields.append(allocator, .{
-                    .field = try allocator.dupe(u8, field_val.string),
-                    .ascending = asc,
-                });
             }
         }
     }
@@ -934,78 +839,6 @@ fn parseOperatorObjectInto(query: *ParsedQuery, field_name: []const u8, obj: std
         const op_value = entry.value_ptr.*;
 
         const operator = parseOperatorString(op_str) orelse continue;
-
-        // Handle $in operator with array value
-        if (operator == .in) {
-            if (op_value == .array) {
-                var in_vals = std.ArrayList(FieldValue).empty;
-                errdefer {
-                    for (in_vals.items) |v| {
-                        if (v == .string) query.allocator.free(v.string);
-                    }
-                    in_vals.deinit(query.allocator);
-                }
-                for (op_value.array.items) |item| {
-                    if (try parseJsonValueAlloc(query.allocator, item)) |v| {
-                        try in_vals.append(query.allocator, v);
-                    }
-                }
-                const name = if (first) field_name else try query.allocator.dupe(u8, field_name);
-                first = false;
-                const pred = Predicate{
-                    .field_name = name,
-                    .operator = .in,
-                    .value = .{ .bool_val = false }, // placeholder
-                    .in_values = try in_vals.toOwnedSlice(query.allocator),
-                };
-                if (target) |t| {
-                    try t.append(query.allocator, pred);
-                } else {
-                    try query.predicates.append(query.allocator, pred);
-                }
-            }
-            continue;
-        }
-
-        // Handle $exists operator (value is bool)
-        if (operator == .exists) {
-            const name = if (first) field_name else try query.allocator.dupe(u8, field_name);
-            first = false;
-            const exists_val = if (op_value == .bool) op_value.bool else true;
-            const pred = Predicate{
-                .field_name = name,
-                .operator = .exists,
-                .value = .{ .bool_val = exists_val },
-            };
-            if (target) |t| {
-                try t.append(query.allocator, pred);
-            } else {
-                try query.predicates.append(query.allocator, pred);
-            }
-            continue;
-        }
-
-        // Handle $regex operator (value is string pattern)
-        if (operator == .regex) {
-            if (op_value == .string) {
-                const name = if (first) field_name else try query.allocator.dupe(u8, field_name);
-                first = false;
-                const pattern = try query.allocator.dupe(u8, op_value.string);
-                const pred = Predicate{
-                    .field_name = name,
-                    .operator = .regex,
-                    .value = .{ .string = pattern }, // store pattern in value.string
-                    .regex_pattern = pattern,
-                };
-                if (target) |t| {
-                    try t.append(query.allocator, pred);
-                } else {
-                    try query.predicates.append(query.allocator, pred);
-                }
-            }
-            continue;
-        }
-
         const value = try parseJsonValueAlloc(query.allocator, op_value) orelse continue;
 
         // First predicate uses the already-duped field_name from caller;
@@ -1084,8 +917,6 @@ fn parseOperatorString(op_str: []const u8) ?Operator {
     if (std.mem.eql(u8, op_str, "$contains")) return .contains;
     if (std.mem.eql(u8, op_str, "$startsWith")) return .starts_with;
     if (std.mem.eql(u8, op_str, "$in")) return .in;
-    if (std.mem.eql(u8, op_str, "$exists")) return .exists;
-    if (std.mem.eql(u8, op_str, "$regex")) return .regex;
     return null;
 }
 
