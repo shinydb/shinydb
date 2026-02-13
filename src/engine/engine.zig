@@ -731,9 +731,8 @@ pub const Engine = struct {
         const collect_limit: u32 = if (has_sort) std.math.maxInt(u32) else actual_limit;
         const collect_offset: u32 = if (has_sort) 0 else actual_offset;
 
-        // Determine if we can use an index (only for equality predicates,
-        // since findBySecondaryIndex only supports exact-value lookups)
-        const best_predicate = parsed.getBestEqIndexPredicate();
+        // Determine the best index strategy: eq > $in > range ($gt/$gte/$lt/$lte)
+        const strategy = parsed.getBestIndexStrategy();
 
         var results: std.ArrayList(Entry) = .empty;
         errdefer {
@@ -743,12 +742,20 @@ pub const Engine = struct {
             results.deinit(self.allocator);
         }
 
-        if (best_predicate) |pred| {
-            // Try to find an index for this field
+        var used_index = false;
+
+        if (strategy) |strat| {
+            // Determine the field name the strategy targets
+            const target_field: []const u8 = switch (strat) {
+                .eq => |pred| pred.field_name,
+                .range => |r| r.field_name,
+                .in_list => |il| il.field_name,
+            };
+
+            // Try to find a secondary index for this field
             self.catalog_mutex.lock();
             var indexes = self.catalog.getIndexesForStore(store_ns, self.allocator) catch {
                 self.catalog_mutex.unlock();
-                // No indexes found, do full scan
                 try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
                 return results.toOwnedSlice(self.allocator);
             };
@@ -757,21 +764,34 @@ pub const Engine = struct {
 
             var found_index: ?[]const u8 = null;
             for (indexes.items) |idx| {
-                if (std.mem.eql(u8, idx.field, pred.field_name)) {
+                if (std.mem.eql(u8, idx.field, target_field)) {
                     found_index = idx.ns;
                     break;
                 }
             }
 
             if (found_index) |index_ns| {
-                // Use secondary index to get candidate primary keys,
-                // then fetch documents and apply ALL predicates for correctness
+                // Get candidate primary keys using the appropriate index method
                 self.db_mutex.lock();
-                var primary_keys = self.db.findBySecondaryIndex(index_ns, pred.value) catch |err| {
-                    self.db_mutex.unlock();
-                    log.warn("Index lookup failed: {}, falling back to full scan", .{err});
-                    try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
-                    return results.toOwnedSlice(self.allocator);
+                var primary_keys = switch (strat) {
+                    .eq => |pred| self.db.findBySecondaryIndex(index_ns, pred.value) catch |err| {
+                        self.db_mutex.unlock();
+                        log.warn("Index eq lookup failed: {}, falling back to full scan", .{err});
+                        try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
+                        return results.toOwnedSlice(self.allocator);
+                    },
+                    .range => |r| self.db.findBySecondaryIndexRange(index_ns, r.min_val, r.max_val, r.min_inclusive, r.max_inclusive) catch |err| {
+                        self.db_mutex.unlock();
+                        log.warn("Index range scan failed: {}, falling back to full scan", .{err});
+                        try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
+                        return results.toOwnedSlice(self.allocator);
+                    },
+                    .in_list => |il| self.db.findBySecondaryIndexMulti(index_ns, il.values) catch |err| {
+                        self.db_mutex.unlock();
+                        log.warn("Index multi-lookup failed: {}, falling back to full scan", .{err});
+                        try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
+                        return results.toOwnedSlice(self.allocator);
+                    },
                 };
                 defer primary_keys.deinit(self.allocator);
 
@@ -785,7 +805,7 @@ pub const Engine = struct {
                     const value = self.db.get(@bitCast(key)) catch continue;
                     defer self.allocator.free(value);
 
-                    // Apply ALL predicates (AND + OR, including the indexed one)
+                    // Apply ALL predicates (AND + OR) for correctness
                     if (!matchesAllPredicates(value, &parsed)) continue;
 
                     // Apply offset
@@ -805,12 +825,12 @@ pub const Engine = struct {
                     count += 1;
                 }
                 self.db_mutex.unlock();
-            } else {
-                // No matching index - fall back to full scan
-                try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
+                used_index = true;
             }
-        } else {
-            // No index - full scan
+        }
+
+        if (!used_index) {
+            // No index available or no indexable predicates - full scan
             try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
         }
 
@@ -1298,65 +1318,157 @@ pub const Engine = struct {
             }
         }.process;
 
-        // First scan memtable for unflushed data
-        {
-            self.db_mutex.lock();
-            defer self.db_mutex.unlock();
+        // Try to use secondary index to narrow the scan
+        var used_index = false;
+        const strategy = parsed.getBestIndexStrategy();
 
-            // Scan active skiplist
-            var active_iter = self.db.memtable.active.iterator();
-            while (active_iter.next()) |entry| {
-                const key_store_id = @as(u16, @intCast((entry.key >> 112) & 0xFFFF));
-                if (key_store_id != store_id) continue;
-                if (entry.kind == .delete) continue;
+        if (strategy) |strat| idx_blk: {
+            const target_field: []const u8 = switch (strat) {
+                .eq => |pred| pred.field_name,
+                .range => |r| r.field_name,
+                .in_list => |il| il.field_name,
+            };
 
-                try seen_keys.put(entry.key, {});
-                try processDoc(self.allocator, entry.value, &parsed, &groups, &extractor, self);
+            self.catalog_mutex.lock();
+            var indexes = self.catalog.getIndexesForStore(store_ns, self.allocator) catch {
+                self.catalog_mutex.unlock();
+                break :idx_blk; // Fall through to full scan
+            };
+            defer indexes.deinit(self.allocator);
+            self.catalog_mutex.unlock();
+
+            var found_index: ?[]const u8 = null;
+            for (indexes.items) |idx| {
+                if (std.mem.eql(u8, idx.field, target_field)) {
+                    found_index = idx.ns;
+                    break;
+                }
             }
 
-            // Scan inactive skiplists
-            var lists_iter = self.db.memtable.lists.iterator();
-            while (lists_iter.next()) |skl| {
-                var skl_iter = skl.iterator();
-                while (skl_iter.next()) |entry| {
+            const index_ns = found_index orelse break :idx_blk;
+
+            // First: process unflushed memtable data (still need full memtable scan for freshness)
+            {
+                self.db_mutex.lock();
+                defer self.db_mutex.unlock();
+
+                var active_iter = self.db.memtable.active.iterator();
+                while (active_iter.next()) |entry| {
                     const key_store_id = @as(u16, @intCast((entry.key >> 112) & 0xFFFF));
                     if (key_store_id != store_id) continue;
                     if (entry.kind == .delete) continue;
-                    if (seen_keys.contains(entry.key)) continue;
 
                     try seen_keys.put(entry.key, {});
                     try processDoc(self.allocator, entry.value, &parsed, &groups, &extractor, self);
                 }
+
+                var lists_iter = self.db.memtable.lists.iterator();
+                while (lists_iter.next()) |skl| {
+                    var skl_iter = skl.iterator();
+                    while (skl_iter.next()) |entry| {
+                        const key_store_id = @as(u16, @intCast((entry.key >> 112) & 0xFFFF));
+                        if (key_store_id != store_id) continue;
+                        if (entry.kind == .delete) continue;
+                        if (seen_keys.contains(entry.key)) continue;
+
+                        try seen_keys.put(entry.key, {});
+                        try processDoc(self.allocator, entry.value, &parsed, &groups, &extractor, self);
+                    }
+                }
             }
+
+            // Then: use index for flushed data (instead of scanning entire primary index)
+            {
+                self.db_mutex.lock();
+                var primary_keys = switch (strat) {
+                    .eq => |pred| self.db.findBySecondaryIndex(index_ns, pred.value) catch {
+                        self.db_mutex.unlock();
+                        break :idx_blk;
+                    },
+                    .range => |r| self.db.findBySecondaryIndexRange(index_ns, r.min_val, r.max_val, r.min_inclusive, r.max_inclusive) catch {
+                        self.db_mutex.unlock();
+                        break :idx_blk;
+                    },
+                    .in_list => |il| self.db.findBySecondaryIndexMulti(index_ns, il.values) catch {
+                        self.db_mutex.unlock();
+                        break :idx_blk;
+                    },
+                };
+                defer primary_keys.deinit(self.allocator);
+
+                for (primary_keys.items) |pk| {
+                    if (seen_keys.contains(pk)) continue;
+
+                    const value = self.db.get(@bitCast(pk)) catch {
+                        continue;
+                    };
+                    defer self.allocator.free(value);
+
+                    try processDoc(self.allocator, value, &parsed, &groups, &extractor, self);
+                }
+                self.db_mutex.unlock();
+            }
+
+            used_index = true;
         }
 
-        // Then scan primary index for flushed data
-        {
-            self.primary_index_mutex.lock();
-            defer self.primary_index_mutex.unlock();
-
-            var iter = try self.primary_index.prefetchIterator();
-            defer iter.deinit();
-
-            while (try iter.next()) |cell| {
-                const key = std.mem.readInt(u128, cell.key[0..@sizeOf(u128)], .big);
-
-                const key_store_id = @as(u16, @intCast((key >> 112) & 0xFFFF));
-                if (key_store_id != store_id) continue;
-                if (seen_keys.contains(key)) continue;
-
-                // Read vlog offset directly from the cell value (avoids re-searching the index)
-                const offset = std.mem.readInt(u64, cell.value[0..@sizeOf(u64)], .little);
-
+        if (!used_index) {
+            // Full scan: memtable + primary index (original path)
+            {
                 self.db_mutex.lock();
-                const value = self.db.getByOffset(@bitCast(key), offset) catch {
-                    self.db_mutex.unlock();
-                    continue;
-                };
-                self.db_mutex.unlock();
-                defer self.allocator.free(value);
+                defer self.db_mutex.unlock();
 
-                try processDoc(self.allocator, value, &parsed, &groups, &extractor, self);
+                var active_iter = self.db.memtable.active.iterator();
+                while (active_iter.next()) |entry| {
+                    const key_store_id = @as(u16, @intCast((entry.key >> 112) & 0xFFFF));
+                    if (key_store_id != store_id) continue;
+                    if (entry.kind == .delete) continue;
+
+                    try seen_keys.put(entry.key, {});
+                    try processDoc(self.allocator, entry.value, &parsed, &groups, &extractor, self);
+                }
+
+                var lists_iter = self.db.memtable.lists.iterator();
+                while (lists_iter.next()) |skl| {
+                    var skl_iter = skl.iterator();
+                    while (skl_iter.next()) |entry| {
+                        const key_store_id = @as(u16, @intCast((entry.key >> 112) & 0xFFFF));
+                        if (key_store_id != store_id) continue;
+                        if (entry.kind == .delete) continue;
+                        if (seen_keys.contains(entry.key)) continue;
+
+                        try seen_keys.put(entry.key, {});
+                        try processDoc(self.allocator, entry.value, &parsed, &groups, &extractor, self);
+                    }
+                }
+            }
+
+            {
+                self.primary_index_mutex.lock();
+                defer self.primary_index_mutex.unlock();
+
+                var iter = try self.primary_index.prefetchIterator();
+                defer iter.deinit();
+
+                while (try iter.next()) |cell| {
+                    const key = std.mem.readInt(u128, cell.key[0..@sizeOf(u128)], .big);
+
+                    const key_store_id = @as(u16, @intCast((key >> 112) & 0xFFFF));
+                    if (key_store_id != store_id) continue;
+                    if (seen_keys.contains(key)) continue;
+
+                    const offset = std.mem.readInt(u64, cell.value[0..@sizeOf(u64)], .little);
+
+                    self.db_mutex.lock();
+                    const value = self.db.getByOffset(@bitCast(key), offset) catch {
+                        self.db_mutex.unlock();
+                        continue;
+                    };
+                    self.db_mutex.unlock();
+                    defer self.allocator.free(value);
+
+                    try processDoc(self.allocator, value, &parsed, &groups, &extractor, self);
+                }
             }
         }
 

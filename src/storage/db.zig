@@ -883,6 +883,125 @@ pub const Db = struct {
         return result;
     }
 
+    /// Range query on secondary index using min/max bounds.
+    /// Supports open-ended ranges (null min or max) and inclusive/exclusive bounds.
+    /// Returns primary keys matching the range.
+    pub fn findBySecondaryIndexRange(
+        self: *Db,
+        index_ns: []const u8,
+        min_val: ?FieldValue,
+        max_val: ?FieldValue,
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) !std.ArrayList(u128) {
+        var result: std.ArrayList(u128) = .empty;
+
+        const index = self.secondary_indexes.get(index_ns) orelse return error.IndexNotFound;
+        const index_meta = self.catalog.indexes.get(index_ns);
+
+        // Convert values to match the index's field type
+        const conv_min = if (min_val) |v| (if (index_meta) |meta| convertFieldValue(v, meta.field_type) else v) else null;
+        const conv_max = if (max_val) |v| (if (index_meta) |meta| convertFieldValue(v, meta.field_type) else v) else null;
+
+        // Build start/end composite keys
+        // For open-ended ranges, use min/max possible values for the field type
+        var start_key_buf: [256]u8 = undefined;
+        var end_key_buf: [256]u8 = undefined;
+
+        const start_key = if (conv_min) |v|
+            try self.makeCompositeKey(&start_key_buf, v, 0)
+        else
+            try self.makeMinCompositeKey(&start_key_buf, index_meta);
+
+        const end_key = if (conv_max) |v|
+            try self.makeCompositeKey(&end_key_buf, v, std.math.maxInt(u128))
+        else
+            try self.makeMaxCompositeKey(&end_key_buf, index_meta);
+
+        var iter = try index.tree.rangeScan(start_key, end_key);
+        defer iter.deinit();
+
+        while (try iter.next()) |entry| {
+            const key_len = entry.key.len;
+            if (key_len < 16) continue;
+
+            const primary_key = std.mem.readInt(u128, entry.key[key_len - 16 ..][0..16], .big);
+
+            // Apply inclusive/exclusive bound checks
+            if (conv_min != null and !min_inclusive) {
+                // Exclude exact matches on the lower bound
+                const field_bytes = entry.key[0 .. key_len - 16];
+                const bound_bytes = start_key[0 .. start_key.len - 16];
+                if (std.mem.eql(u8, field_bytes, bound_bytes)) continue;
+            }
+            if (conv_max != null and !max_inclusive) {
+                // Exclude exact matches on the upper bound
+                const field_bytes = entry.key[0 .. key_len - 16];
+                const bound_bytes = end_key[0 .. end_key.len - 16];
+                if (std.mem.eql(u8, field_bytes, bound_bytes)) continue;
+            }
+
+            try result.append(self.allocator, primary_key);
+        }
+
+        return result;
+    }
+
+    /// Multi-value lookup on secondary index (for $in operator).
+    /// Performs one range scan per value and deduplicates results.
+    pub fn findBySecondaryIndexMulti(
+        self: *Db,
+        index_ns: []const u8,
+        values: []const FieldValue,
+    ) !std.ArrayList(u128) {
+        var result: std.ArrayList(u128) = .empty;
+        var seen = std.AutoHashMap(u128, void).init(self.allocator);
+        defer seen.deinit();
+
+        for (values) |fv| {
+            var keys = try self.findBySecondaryIndex(index_ns, fv);
+            defer keys.deinit(self.allocator);
+            for (keys.items) |pk| {
+                if (!seen.contains(pk)) {
+                    try seen.put(pk, {});
+                    try result.append(self.allocator, pk);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// Create a composite key with minimum possible field bytes (all zeros)
+    fn makeMinCompositeKey(_: *Db, buf: []u8, index_meta: ?*const proto.Index) ![]const u8 {
+        const field_size: usize = if (index_meta) |meta| switch (meta.field_type) {
+            .String => 8, // hash size
+            .U64, .I64, .F64 => 8,
+            .U32, .I32 => 4,
+            .Boolean => 1,
+            else => 8,
+        } else 8;
+
+        @memset(buf[0..field_size], 0);
+        std.mem.writeInt(u128, buf[field_size..][0..16], 0, .big);
+        return buf[0 .. field_size + 16];
+    }
+
+    /// Create a composite key with maximum possible field bytes (all 0xFF)
+    fn makeMaxCompositeKey(_: *Db, buf: []u8, index_meta: ?*const proto.Index) ![]const u8 {
+        const field_size: usize = if (index_meta) |meta| switch (meta.field_type) {
+            .String => 8,
+            .U64, .I64, .F64 => 8,
+            .U32, .I32 => 4,
+            .Boolean => 1,
+            else => 8,
+        } else 8;
+
+        @memset(buf[0..field_size], 0xFF);
+        std.mem.writeInt(u128, buf[field_size..][0..16], std.math.maxInt(u128), .big);
+        return buf[0 .. field_size + 16];
+    }
+
     /// Helper struct for batching vlog reads
     const VlogReadRequest = struct {
         key: u128,

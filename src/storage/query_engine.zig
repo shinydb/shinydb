@@ -669,6 +669,98 @@ pub const ParsedQuery = struct {
         return null;
     }
 
+    /// Describes an index-accelerated access strategy
+    pub const IndexStrategy = union(enum) {
+        /// Equality lookup: field = value
+        eq: Predicate,
+        /// Range scan: field between bounds
+        range: struct {
+            field_name: []const u8,
+            min_val: ?FieldValue,
+            max_val: ?FieldValue,
+            min_inclusive: bool,
+            max_inclusive: bool,
+        },
+        /// Multi-value lookup: field IN [v1, v2, ...]
+        in_list: struct {
+            field_name: []const u8,
+            values: []FieldValue,
+        },
+    };
+
+    /// Determine the best index strategy from the predicates.
+    /// Priority: $eq > $in > range ($gt/$gte/$lt/$lte)
+    pub fn getBestIndexStrategy(self: *const ParsedQuery) ?IndexStrategy {
+        // 1. Prefer equality (cheapest: single range scan)
+        for (self.predicates.items) |pred| {
+            if (pred.operator == .eq) return .{ .eq = pred };
+        }
+
+        // 2. Next prefer $in (N equality lookups)
+        for (self.predicates.items) |pred| {
+            if (pred.operator == .in) {
+                if (pred.in_values) |vals| {
+                    return .{ .in_list = .{
+                        .field_name = pred.field_name,
+                        .values = vals,
+                    } };
+                }
+            }
+        }
+
+        // 3. Collect range bounds on the same field ($gt/$gte/$lt/$lte)
+        // Find the first range predicate, then collect all bounds for that field
+        var range_field: ?[]const u8 = null;
+        for (self.predicates.items) |pred| {
+            if (pred.operator == .gt or pred.operator == .gte or
+                pred.operator == .lt or pred.operator == .lte)
+            {
+                range_field = pred.field_name;
+                break;
+            }
+        }
+
+        if (range_field) |field| {
+            var min_val: ?FieldValue = null;
+            var max_val: ?FieldValue = null;
+            var min_inclusive: bool = false;
+            var max_inclusive: bool = false;
+
+            for (self.predicates.items) |pred| {
+                if (!std.mem.eql(u8, pred.field_name, field)) continue;
+                switch (pred.operator) {
+                    .gt => {
+                        min_val = pred.value;
+                        min_inclusive = false;
+                    },
+                    .gte => {
+                        min_val = pred.value;
+                        min_inclusive = true;
+                    },
+                    .lt => {
+                        max_val = pred.value;
+                        max_inclusive = false;
+                    },
+                    .lte => {
+                        max_val = pred.value;
+                        max_inclusive = true;
+                    },
+                    else => {},
+                }
+            }
+
+            return .{ .range = .{
+                .field_name = field,
+                .min_val = min_val,
+                .max_val = max_val,
+                .min_inclusive = min_inclusive,
+                .max_inclusive = max_inclusive,
+            } };
+        }
+
+        return null;
+    }
+
     /// Get range bounds for a field (returns min_bound, max_bound)
     pub fn getRangeBounds(self: *const ParsedQuery, field_name: []const u8) struct { min: ?i64, max: ?i64, min_inclusive: bool, max_inclusive: bool } {
         var result: struct { min: ?i64, max: ?i64, min_inclusive: bool, max_inclusive: bool } = .{
