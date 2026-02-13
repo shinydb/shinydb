@@ -486,12 +486,19 @@ pub const QueryPlan = struct {
     estimated_cost: u64,
 };
 
+/// Sort specification for multi-field sorting
+pub const SortSpec = struct {
+    field: []const u8,
+    ascending: bool,
+};
+
 /// Parsed query from JSON
 pub const ParsedQuery = struct {
     allocator: Allocator,
     predicates: std.ArrayList(Predicate),
     sort_field: ?[]const u8 = null,
     sort_ascending: bool = true,
+    sort_fields: std.ArrayList(SortSpec) = .empty,
     limit: ?u32 = null,
     offset: u32 = 0,
     // OR predicates: each inner list is AND'd, outer list is OR'd
@@ -541,6 +548,11 @@ pub const ParsedQuery = struct {
         if (self.sort_field) |sf| {
             self.allocator.free(sf);
         }
+        // Clean up multi-field sort specs
+        for (self.sort_fields.items) |spec| {
+            self.allocator.free(spec.field);
+        }
+        self.sort_fields.deinit(self.allocator);
         // Clean up aggregation specs
         for (self.aggregations.items) |agg| {
             self.allocator.free(agg.name);
@@ -662,11 +674,23 @@ pub fn parseJsonQuery(allocator: Allocator, json_str: []const u8) !ParsedQuery {
     if (root.object.get("sort")) |sort_val| {
         if (sort_val == .object) {
             var it = sort_val.object.iterator();
+            // First field goes to sort_field for backward compat
             if (it.next()) |entry| {
                 query.sort_field = try allocator.dupe(u8, entry.key_ptr.*);
-                if (entry.value_ptr.* == .integer) {
-                    query.sort_ascending = entry.value_ptr.integer >= 0;
-                }
+                const asc = if (entry.value_ptr.* == .integer) entry.value_ptr.integer >= 0 else true;
+                query.sort_ascending = asc;
+                try query.sort_fields.append(allocator, .{
+                    .field = try allocator.dupe(u8, entry.key_ptr.*),
+                    .ascending = asc,
+                });
+            }
+            // Additional sort fields
+            while (it.next()) |entry| {
+                const asc = if (entry.value_ptr.* == .integer) entry.value_ptr.integer >= 0 else true;
+                try query.sort_fields.append(allocator, .{
+                    .field = try allocator.dupe(u8, entry.key_ptr.*),
+                    .ascending = asc,
+                });
             }
         }
     } else if (root.object.get("orderBy")) |ob_val| {

@@ -727,7 +727,7 @@ pub const Engine = struct {
 
         // When sorting is requested, we must collect ALL matching docs first,
         // sort them, then apply limit/offset. Otherwise we'd truncate before sorting.
-        const has_sort = parsed.sort_field != null;
+        const has_sort = parsed.sort_field != null or parsed.sort_fields.items.len > 0;
         const collect_limit: u32 = if (has_sort) std.math.maxInt(u32) else actual_limit;
         const collect_offset: u32 = if (has_sort) 0 else actual_offset;
 
@@ -822,7 +822,31 @@ pub const Engine = struct {
         }
 
         // Sort results if order_by is specified
-        if (parsed.sort_field) |sort_field| {
+        if (parsed.sort_fields.items.len > 1) {
+            // Multi-field sort
+            const sort_specs = parsed.sort_fields.items;
+            const items = results.items;
+            std.sort.insertion(Entry, items, sort_specs, struct {
+                fn lessThan(specs: []const query_engine.SortSpec, a: Entry, b: Entry) bool {
+                    return compareByMultiFields(a.value, b.value, specs);
+                }
+            }.lessThan);
+
+            // Apply offset and limit AFTER sorting
+            if (actual_offset > 0 or actual_limit < std.math.maxInt(u32)) {
+                const start = @min(actual_offset, @as(u32, @intCast(results.items.len)));
+                const end = @min(start +| actual_limit, @as(u32, @intCast(results.items.len)));
+                for (results.items[0..start]) |entry| {
+                    self.allocator.free(entry.value);
+                }
+                for (results.items[end..]) |entry| {
+                    self.allocator.free(entry.value);
+                }
+                const kept = results.items[start..end];
+                std.mem.copyForwards(Entry, results.items[0..kept.len], kept);
+                results.shrinkRetainingCapacity(kept.len);
+            }
+        } else if (parsed.sort_field) |sort_field| {
             const asc = parsed.sort_ascending;
             const items = results.items;
             std.sort.insertion(Entry, items, SortContext{ .field = sort_field, .ascending = asc }, struct {
@@ -865,6 +889,38 @@ pub const Engine = struct {
         field: []const u8,
         ascending: bool,
     };
+
+    /// Compare two documents by multiple sort fields
+    fn compareByMultiFields(a_bson: []const u8, b_bson: []const u8, specs: []const query_engine.SortSpec) bool {
+        const allocator = std.heap.page_allocator;
+
+        const a_doc = bson.BsonDocument.init(allocator, a_bson, false) catch return false;
+        var a_mut = a_doc;
+        defer a_mut.deinit();
+
+        const b_doc = bson.BsonDocument.init(allocator, b_bson, false) catch return true;
+        var b_mut = b_doc;
+        defer b_mut.deinit();
+
+        for (specs) |spec| {
+            const a_val_opt = blk: {
+                const result = a_doc.getField(spec.field) catch break :blk null;
+                break :blk result;
+            };
+            const b_val_opt = blk: {
+                const result = b_doc.getField(spec.field) catch break :blk null;
+                break :blk result;
+            };
+
+            const a_val = a_val_opt orelse continue;
+            const b_val = b_val_opt orelse continue;
+
+            const cmp = compareBsonValues(a_val, b_val);
+            if (cmp == .eq) continue;
+            return if (spec.ascending) cmp == .lt else cmp == .gt;
+        }
+        return false; // All fields equal
+    }
 
     fn fullScanWithFilter(self: *Self, results: *std.ArrayList(Entry), store_id: u16, parsed: *const @import("../storage/query_engine.zig").ParsedQuery, limit: u32, offset: u32) !void {
         // Track keys we've seen to avoid duplicates between memtable and index
