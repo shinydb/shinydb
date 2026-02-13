@@ -380,6 +380,9 @@ pub const Db = struct {
     /// Create a secondary index for a specific field
     /// This will create the index structure and populate it by scanning the primary index
     pub fn createSecondaryIndex(self: *Db, store_id: u16, index_ns: []const u8, field_name: []const u8, field_type: proto.FieldType) !void {
+        // Skip if index already exists
+        if (self.secondary_indexes.contains(index_ns)) return;
+
         // Create index in catalog with store_id
         _ = try self.catalog.createIndexForStore(store_id, index_ns, field_name, field_type, false);
 
