@@ -1689,7 +1689,7 @@ fn compareBsonValue(bson_val: bson.Value, field_val: FieldValue, op: QueryOperat
                     .lte => std.mem.order(u8, s, field_val.string) != .gt,
                     .contains => std.mem.indexOf(u8, s, field_val.string) != null,
                     .starts_with => std.mem.startsWith(u8, s, field_val.string),
-                    .in => false,
+                    .in, .exists, .regex => false,
                 };
             }
             break :blk false;
