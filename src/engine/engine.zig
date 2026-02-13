@@ -785,15 +785,8 @@ pub const Engine = struct {
                     const value = self.db.get(@bitCast(key)) catch continue;
                     defer self.allocator.free(value);
 
-                    // Apply ALL predicates (including the indexed one)
-                    var matches = true;
-                    for (parsed.predicates.items) |p| {
-                        if (!matchesPredicate(value, p)) {
-                            matches = false;
-                            break;
-                        }
-                    }
-                    if (!matches) continue;
+                    // Apply ALL predicates (AND + OR, including the indexed one)
+                    if (!matchesAllPredicates(value, &parsed)) continue;
 
                     // Apply offset
                     if (skipped < collect_offset) {
@@ -904,11 +897,11 @@ pub const Engine = struct {
 
         for (specs) |spec| {
             const a_val_opt = blk: {
-                const result = a_doc.getField(spec.field) catch break :blk null;
+                const result = a_doc.getNestedField(spec.field) catch break :blk null;
                 break :blk result;
             };
             const b_val_opt = blk: {
-                const result = b_doc.getField(spec.field) catch break :blk null;
+                const result = b_doc.getNestedField(spec.field) catch break :blk null;
                 break :blk result;
             };
 
@@ -956,16 +949,8 @@ pub const Engine = struct {
                 // Mark as seen
                 try seen_keys.put(entry.key, {});
 
-                // Apply predicates
-                var matches = true;
-                for (parsed.predicates.items) |pred| {
-                    if (!matchesPredicate(entry.value, pred)) {
-                        matches = false;
-                        break;
-                    }
-                }
-
-                if (!matches) continue;
+                // Apply predicates (AND + OR)
+                if (!matchesAllPredicates(entry.value, parsed)) continue;
 
                 // Apply offset
                 if (skipped < offset) {
@@ -1006,16 +991,8 @@ pub const Engine = struct {
                     if (seen_keys.contains(entry.key)) continue;
                     try seen_keys.put(entry.key, {});
 
-                    // Apply predicates
-                    var matches = true;
-                    for (parsed.predicates.items) |pred| {
-                        if (!matchesPredicate(entry.value, pred)) {
-                            matches = false;
-                            break;
-                        }
-                    }
-
-                    if (!matches) continue;
+                    // Apply predicates (AND + OR)
+                    if (!matchesAllPredicates(entry.value, parsed)) continue;
 
                     // Apply offset
                     if (skipped < offset) {
@@ -1076,16 +1053,8 @@ pub const Engine = struct {
                 };
                 self.db_mutex.unlock();
 
-                // Apply predicates
-                var matches = true;
-                for (parsed.predicates.items) |pred| {
-                    if (!matchesPredicate(value, pred)) {
-                        matches = false;
-                        break;
-                    }
-                }
-
-                if (!matches) {
+                // Apply predicates (AND + OR)
+                if (!matchesAllPredicates(value, parsed)) {
                     self.allocator.free(value);
                     continue;
                 }
@@ -1397,66 +1366,49 @@ pub const Engine = struct {
 
     /// Compute a group key from document based on group_by fields
     fn computeGroupKey(self: *Self, doc_json: []const u8, group_by_fields: ?[][]const u8, extractor: *@import("../storage/field_extractor.zig").FieldExtractor) ![]u8 {
+        _ = extractor;
         const fields = group_by_fields orelse return try self.allocator.dupe(u8, "_default");
 
         var key_parts: std.ArrayList(u8) = .empty;
         errdefer key_parts.deinit(self.allocator);
 
+        // Use BSON getNestedField for direct field access (supports all types)
+        const doc = bson.BsonDocument.init(self.allocator, doc_json, false) catch {
+            return try self.allocator.dupe(u8, "_error");
+        };
+        var doc_mut = doc;
+        defer doc_mut.deinit();
+
         for (fields, 0..) |field, i| {
             if (i > 0) try key_parts.append(self.allocator, '|');
 
-            // Try to extract field value - handle TypeMismatch gracefully
-            if (extractor.extractString(doc_json, field)) |opt_val| {
-                if (opt_val) |val| {
-                    defer self.allocator.free(val);
-                    try key_parts.appendSlice(self.allocator, val);
-                } else {
-                    // Field exists but is null, try other types
-                    if (extractor.extractI64(doc_json, field)) |opt_i64| {
-                        if (opt_i64) |val| {
+            if (doc.getNestedField(field)) |val_opt| {
+                if (val_opt) |val| {
+                    switch (val) {
+                        .string => |s| try key_parts.appendSlice(self.allocator, s),
+                        .int32 => |v| {
                             var buf: [32]u8 = undefined;
-                            const formatted = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
+                            const formatted = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "0";
                             try key_parts.appendSlice(self.allocator, formatted);
-                        } else {
-                            try key_parts.appendSlice(self.allocator, "null");
-                        }
-                    } else |_| {
-                        try key_parts.appendSlice(self.allocator, "null");
-                    }
-                }
-            } else |err| switch (err) {
-                error.TypeMismatch => {
-                    // Try i64 extraction
-                    if (extractor.extractI64(doc_json, field)) |opt_val| {
-                        if (opt_val) |val| {
-                            var buf: [32]u8 = undefined;
-                            const formatted = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
-                            try key_parts.appendSlice(self.allocator, formatted);
-                        } else {
-                            try key_parts.appendSlice(self.allocator, "null");
-                        }
-                    } else |i64_err| switch (i64_err) {
-                        error.TypeMismatch => {
-                            // Try f64 extraction
-                            if (extractor.extractF64(doc_json, field)) |opt_val| {
-                                if (opt_val) |val| {
-                                    var buf: [64]u8 = undefined;
-                                    const formatted = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "0";
-                                    try key_parts.appendSlice(self.allocator, formatted);
-                                } else {
-                                    try key_parts.appendSlice(self.allocator, "null");
-                                }
-                            } else |f64_err| switch (f64_err) {
-                                error.TypeMismatch => {
-                                    try key_parts.appendSlice(self.allocator, "null");
-                                },
-                                else => return f64_err,
-                            }
                         },
-                        else => return i64_err,
+                        .int64 => |v| {
+                            var buf: [32]u8 = undefined;
+                            const formatted = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "0";
+                            try key_parts.appendSlice(self.allocator, formatted);
+                        },
+                        .double => |v| {
+                            var buf: [64]u8 = undefined;
+                            const formatted = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "0";
+                            try key_parts.appendSlice(self.allocator, formatted);
+                        },
+                        .boolean => |v| try key_parts.appendSlice(self.allocator, if (v) "true" else "false"),
+                        else => try key_parts.appendSlice(self.allocator, "null"),
                     }
-                },
-                else => return err,
+                } else {
+                    try key_parts.appendSlice(self.allocator, "null");
+                }
+            } else |_| {
+                try key_parts.appendSlice(self.allocator, "null");
             }
         }
 
@@ -1645,8 +1597,8 @@ fn matchesPredicate(doc_bson: []const u8, pred: query_engine.Predicate) bool {
         var mutable_doc = doc;
         defer mutable_doc.deinit();
 
-        // Try to get the field value from BSON
-        if (doc.getField(pred.field_name)) |field_value_opt| {
+        // Try to get the field value from BSON (supports nested dot-notation)
+        if (doc.getNestedField(pred.field_name)) |field_value_opt| {
             if (field_value_opt) |field_value| {
                 // Compare BSON value with predicate value
                 return compareBsonValue(field_value, pred.value, pred.operator);
@@ -1662,22 +1614,53 @@ fn matchesPredicate(doc_bson: []const u8, pred: query_engine.Predicate) bool {
     }
 }
 
+/// Check if a document matches all AND predicates + OR predicate groups
+fn matchesAllPredicates(doc_bson: []const u8, parsed: *const query_engine.ParsedQuery) bool {
+    // All AND predicates must match
+    for (parsed.predicates.items) |pred| {
+        if (!matchesPredicate(doc_bson, pred)) return false;
+    }
+    // If OR groups exist, at least one group must fully match
+    if (parsed.or_predicates.items.len > 0) {
+        var any_group_matched = false;
+        for (parsed.or_predicates.items) |group| {
+            var group_matches = true;
+            for (group.items) |pred| {
+                if (!matchesPredicate(doc_bson, pred)) {
+                    group_matches = false;
+                    break;
+                }
+            }
+            if (group_matches) {
+                any_group_matched = true;
+                break;
+            }
+        }
+        if (!any_group_matched) return false;
+    }
+    return true;
+}
+
 const QueryOperator = query_engine.Operator;
 
 /// Compare a BSON Value with a FieldValue using an operator
 fn compareBsonValue(bson_val: bson.Value, field_val: FieldValue, op: QueryOperator) bool {
     return switch (bson_val) {
         .string => |s| blk: {
-            if (field_val != .string) break :blk false;
-            break :blk switch (op) {
-                .eq => std.mem.eql(u8, s, field_val.string),
-                .ne => !std.mem.eql(u8, s, field_val.string),
-                .gt => std.mem.order(u8, s, field_val.string) == .gt,
-                .gte => std.mem.order(u8, s, field_val.string) != .lt,
-                .lt => std.mem.order(u8, s, field_val.string) == .lt,
-                .lte => std.mem.order(u8, s, field_val.string) != .gt,
-                else => false,
-            };
+            if (field_val == .string) {
+                break :blk switch (op) {
+                    .eq => std.mem.eql(u8, s, field_val.string),
+                    .ne => !std.mem.eql(u8, s, field_val.string),
+                    .gt => std.mem.order(u8, s, field_val.string) == .gt,
+                    .gte => std.mem.order(u8, s, field_val.string) != .lt,
+                    .lt => std.mem.order(u8, s, field_val.string) == .lt,
+                    .lte => std.mem.order(u8, s, field_val.string) != .gt,
+                    .contains => std.mem.indexOf(u8, s, field_val.string) != null,
+                    .starts_with => std.mem.startsWith(u8, s, field_val.string),
+                    .in => false,
+                };
+            }
+            break :blk false;
         },
         .int32 => |i| {
             const i64_val: i64 = i;
@@ -1876,11 +1859,11 @@ fn compareByField(a_bson: []const u8, b_bson: []const u8, field: []const u8, asc
     defer b_mut.deinit();
 
     const a_val_opt = blk: {
-        const result = a_doc.getField(field) catch break :blk null;
+        const result = a_doc.getNestedField(field) catch break :blk null;
         break :blk result;
     };
     const b_val_opt = blk: {
-        const result = b_doc.getField(field) catch break :blk null;
+        const result = b_doc.getNestedField(field) catch break :blk null;
         break :blk result;
     };
 
