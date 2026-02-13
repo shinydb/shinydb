@@ -496,6 +496,8 @@ pub const ParsedQuery = struct {
     offset: u32 = 0,
     // OR predicates: each inner list is AND'd, outer list is OR'd
     or_predicates: std.ArrayList(std.ArrayList(Predicate)) = .empty,
+    // Projection fields (select/pluck)
+    projection_fields: ?[][]const u8 = null,
     // Aggregation fields
     aggregations: std.ArrayList(AggregationSpec) = .empty,
     group_by_fields: ?[][]const u8 = null,
@@ -529,6 +531,13 @@ pub const ParsedQuery = struct {
             group.deinit(self.allocator);
         }
         self.or_predicates.deinit(self.allocator);
+        // Clean up projection fields
+        if (self.projection_fields) |fields| {
+            for (fields) |f| {
+                self.allocator.free(f);
+            }
+            self.allocator.free(fields);
+        }
         if (self.sort_field) |sf| {
             self.allocator.free(sf);
         }
@@ -691,6 +700,32 @@ pub fn parseJsonQuery(allocator: Allocator, json_str: []const u8) !ParsedQuery {
     } else if (root.object.get("skip")) |skip_val| {
         if (skip_val == .integer) {
             query.offset = @intCast(skip_val.integer);
+        }
+    }
+
+    // Parse projection (select/pluck)
+    const proj_val = root.object.get("select") orelse
+        root.object.get("$select") orelse
+        root.object.get("pluck") orelse
+        root.object.get("$pluck") orelse
+        root.object.get("projection");
+    if (proj_val) |pv| {
+        if (pv == .array) {
+            var proj_fields: std.ArrayList([]const u8) = .empty;
+            errdefer {
+                for (proj_fields.items) |f| allocator.free(f);
+                proj_fields.deinit(allocator);
+            }
+            for (pv.array.items) |item| {
+                if (item == .string) {
+                    try proj_fields.append(allocator, try allocator.dupe(u8, item.string));
+                }
+            }
+            if (proj_fields.items.len > 0) {
+                query.projection_fields = try proj_fields.toOwnedSlice(allocator);
+            } else {
+                proj_fields.deinit(allocator);
+            }
         }
     }
 

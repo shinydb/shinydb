@@ -849,6 +849,15 @@ pub const Engine = struct {
             }
         }
 
+        // Apply projection if specified
+        if (parsed.projection_fields) |proj_fields| {
+            for (results.items) |*entry| {
+                const projected = applyProjection(self.allocator, entry.value, proj_fields) catch continue;
+                self.allocator.free(entry.value);
+                entry.value = projected;
+            }
+        }
+
         return results.toOwnedSlice(self.allocator);
     }
 
@@ -1851,6 +1860,26 @@ fn bsonToF64(val: bson.Value) ?f64 {
         .double => |v| v,
         else => null,
     };
+}
+
+/// Apply projection: build a new BSON document containing only the specified fields
+fn applyProjection(allocator: std.mem.Allocator, doc_bson: []const u8, fields: [][]const u8) ![]const u8 {
+    const src_doc = try bson.BsonDocument.init(allocator, doc_bson, false);
+    var src_mut = src_doc;
+    defer src_mut.deinit();
+
+    var out_doc = bson.BsonDocument.empty(allocator);
+    errdefer out_doc.deinit();
+
+    for (fields) |field| {
+        if (try src_doc.getNestedField(field)) |val| {
+            try out_doc.put(field, val);
+        }
+    }
+
+    const result = try allocator.dupe(u8, out_doc.toBytes());
+    out_doc.deinit();
+    return result;
 }
 
 // ============================================================================
