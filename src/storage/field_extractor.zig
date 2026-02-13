@@ -12,52 +12,92 @@ pub const FieldExtractor = struct {
         return .{ .allocator = allocator };
     }
 
-    /// Extract a string field from BSON
+    /// Extract a string field from BSON (supports nested dot-notation)
     pub fn extractString(self: *FieldExtractor, bson_value: []const u8, field_name: []const u8) !?[]const u8 {
         const doc = try bson.BsonDocument.init(self.allocator, bson_value, false);
-        return try doc.getString(field_name);
+        if (try doc.getNestedField(field_name)) |val| {
+            return switch (val) {
+                .string => |s| s,
+                else => return error.TypeMismatch,
+            };
+        }
+        return null;
     }
 
-    /// Extract a u64 field from BSON
+    /// Extract a u64 field from BSON (supports nested dot-notation)
     pub fn extractU64(self: *FieldExtractor, bson_value: []const u8, field_name: []const u8) !?u64 {
         const doc = try bson.BsonDocument.init(self.allocator, bson_value, false);
-        if (try doc.getInt64(field_name)) |val| {
-            return @intCast(val);
+        if (try doc.getNestedField(field_name)) |val| {
+            return switch (val) {
+                .int64 => |v| if (v >= 0) @intCast(v) else return error.TypeMismatch,
+                .int32 => |v| if (v >= 0) @intCast(v) else return error.TypeMismatch,
+                else => return error.TypeMismatch,
+            };
         }
         return null;
     }
 
-    /// Extract an i64 field from BSON
+    /// Extract an i64 field from BSON (supports nested dot-notation)
     pub fn extractI64(self: *FieldExtractor, bson_value: []const u8, field_name: []const u8) !?i64 {
         const doc = try bson.BsonDocument.init(self.allocator, bson_value, false);
-        return try doc.getInt64(field_name);
-    }
-
-    /// Extract a u32 field from BSON
-    pub fn extractU32(self: *FieldExtractor, bson_value: []const u8, field_name: []const u8) !?u32 {
-        const doc = try bson.BsonDocument.init(self.allocator, bson_value, false);
-        if (try doc.getInt32(field_name)) |val| {
-            return @intCast(val);
+        if (try doc.getNestedField(field_name)) |val| {
+            return switch (val) {
+                .int64 => |v| v,
+                .int32 => |v| @intCast(v),
+                else => return error.TypeMismatch,
+            };
         }
         return null;
     }
 
-    /// Extract an i32 field from BSON
+    /// Extract a u32 field from BSON (supports nested dot-notation)
+    pub fn extractU32(self: *FieldExtractor, bson_value: []const u8, field_name: []const u8) !?u32 {
+        const doc = try bson.BsonDocument.init(self.allocator, bson_value, false);
+        if (try doc.getNestedField(field_name)) |val| {
+            return switch (val) {
+                .int32 => |v| if (v >= 0) @intCast(v) else return error.TypeMismatch,
+                else => return error.TypeMismatch,
+            };
+        }
+        return null;
+    }
+
+    /// Extract an i32 field from BSON (supports nested dot-notation)
     pub fn extractI32(self: *FieldExtractor, bson_value: []const u8, field_name: []const u8) !?i32 {
         const doc = try bson.BsonDocument.init(self.allocator, bson_value, false);
-        return try doc.getInt32(field_name);
+        if (try doc.getNestedField(field_name)) |val| {
+            return switch (val) {
+                .int32 => |v| v,
+                else => return error.TypeMismatch,
+            };
+        }
+        return null;
     }
 
-    /// Extract a boolean field from BSON
+    /// Extract a boolean field from BSON (supports nested dot-notation)
     pub fn extractBool(self: *FieldExtractor, bson_value: []const u8, field_name: []const u8) !?bool {
         const doc = try bson.BsonDocument.init(self.allocator, bson_value, false);
-        return try doc.getBool(field_name);
+        if (try doc.getNestedField(field_name)) |val| {
+            return switch (val) {
+                .boolean => |v| v,
+                else => return error.TypeMismatch,
+            };
+        }
+        return null;
     }
 
-    /// Extract an f64 field from BSON
+    /// Extract an f64 field from BSON (supports nested dot-notation)
     pub fn extractF64(self: *FieldExtractor, bson_value: []const u8, field_name: []const u8) !?f64 {
         const doc = try bson.BsonDocument.init(self.allocator, bson_value, false);
-        return try doc.getDouble(field_name);
+        if (try doc.getNestedField(field_name)) |val| {
+            return switch (val) {
+                .double => |v| v,
+                .int64 => |v| @floatFromInt(v),
+                .int32 => |v| @floatFromInt(v),
+                else => return error.TypeMismatch,
+            };
+        }
+        return null;
     }
 
     /// Generic field extractor that returns the appropriate type based on FieldType
