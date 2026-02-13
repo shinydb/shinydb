@@ -494,6 +494,8 @@ pub const ParsedQuery = struct {
     sort_ascending: bool = true,
     limit: ?u32 = null,
     offset: u32 = 0,
+    // OR predicates: each inner list is AND'd, outer list is OR'd
+    or_predicates: std.ArrayList(std.ArrayList(Predicate)) = .empty,
     // Aggregation fields
     aggregations: std.ArrayList(AggregationSpec) = .empty,
     group_by_fields: ?[][]const u8 = null,
@@ -516,6 +518,17 @@ pub const ParsedQuery = struct {
             }
         }
         self.predicates.deinit(self.allocator);
+        // Clean up OR predicate groups
+        for (self.or_predicates.items) |*group| {
+            for (group.items) |pred| {
+                self.allocator.free(pred.field_name);
+                if (pred.value == .string) {
+                    self.allocator.free(pred.value.string);
+                }
+            }
+            group.deinit(self.allocator);
+        }
+        self.or_predicates.deinit(self.allocator);
         if (self.sort_field) |sf| {
             self.allocator.free(sf);
         }
@@ -706,8 +719,13 @@ fn parseFilterObject(query: *ParsedQuery, obj: std.json.ObjectMap) !void {
         const field_value = entry.value_ptr.*;
 
         // Check for logical operators
-        if (std.mem.startsWith(u8, field_name_raw, "$")) {
-            // TODO: Handle $and, $or, $not
+        if (std.mem.eql(u8, field_name_raw, "$or")) {
+            if (field_value == .array) {
+                try parseOrArray(query, field_value.array);
+            }
+            continue;
+        } else if (std.mem.startsWith(u8, field_name_raw, "$")) {
+            // TODO: Handle $and, $not
             continue;
         }
 
@@ -750,6 +768,11 @@ fn parseFilterObject(query: *ParsedQuery, obj: std.json.ObjectMap) !void {
 }
 
 fn parseOperatorObject(query: *ParsedQuery, field_name: []const u8, obj: std.json.ObjectMap) !void {
+    try parseOperatorObjectInto(query, field_name, obj, null);
+}
+
+/// Parse operator object into either the main predicates list or a target list (for $or groups)
+fn parseOperatorObjectInto(query: *ParsedQuery, field_name: []const u8, obj: std.json.ObjectMap, target: ?*std.ArrayList(Predicate)) !void {
     var first = true;
     var it = obj.iterator();
     while (it.next()) |entry| {
@@ -765,11 +788,63 @@ fn parseOperatorObject(query: *ParsedQuery, field_name: []const u8, obj: std.jso
         const name = if (first) field_name else try query.allocator.dupe(u8, field_name);
         first = false;
 
-        try query.predicates.append(query.allocator, .{
+        const pred = Predicate{
             .field_name = name,
             .operator = operator,
             .value = value,
-        });
+        };
+
+        if (target) |t| {
+            try t.append(query.allocator, pred);
+        } else {
+            try query.predicates.append(query.allocator, pred);
+        }
+    }
+}
+
+/// Parse $or array: [{"field1": "val1"}, {"field2": {"$gt": 10}}]
+fn parseOrArray(query: *ParsedQuery, arr: std.json.Array) !void {
+    for (arr.items) |item| {
+        if (item != .object) continue;
+
+        var group: std.ArrayList(Predicate) = .empty;
+        errdefer {
+            for (group.items) |pred| {
+                query.allocator.free(pred.field_name);
+                if (pred.value == .string) query.allocator.free(pred.value.string);
+            }
+            group.deinit(query.allocator);
+        }
+
+        var obj_it = item.object.iterator();
+        while (obj_it.next()) |field_entry| {
+            const fname_raw = field_entry.key_ptr.*;
+            const fvalue = field_entry.value_ptr.*;
+
+            if (std.mem.startsWith(u8, fname_raw, "$")) continue;
+
+            const fname = try query.allocator.dupe(u8, fname_raw);
+            errdefer query.allocator.free(fname);
+
+            if (fvalue == .string) {
+                const str_val = try query.allocator.dupe(u8, fvalue.string);
+                try group.append(query.allocator, .{ .field_name = fname, .operator = .eq, .value = .{ .string = str_val } });
+            } else if (fvalue == .integer) {
+                try group.append(query.allocator, .{ .field_name = fname, .operator = .eq, .value = .{ .i64_val = fvalue.integer } });
+            } else if (fvalue == .float) {
+                try group.append(query.allocator, .{ .field_name = fname, .operator = .eq, .value = .{ .f64_val = fvalue.float } });
+            } else if (fvalue == .bool) {
+                try group.append(query.allocator, .{ .field_name = fname, .operator = .eq, .value = .{ .bool_val = fvalue.bool } });
+            } else if (fvalue == .object) {
+                try parseOperatorObjectInto(query, fname, fvalue.object, &group);
+            }
+        }
+
+        if (group.items.len > 0) {
+            try query.or_predicates.append(query.allocator, group);
+        } else {
+            group.deinit(query.allocator);
+        }
     }
 }
 
