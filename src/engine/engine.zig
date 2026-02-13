@@ -771,29 +771,37 @@ pub const Engine = struct {
             }
 
             if (found_index) |index_ns| {
+                const strategy_name: []const u8 = switch (strat) {
+                    .eq => "eq",
+                    .range => "range",
+                    .in_list => "in",
+                };
+                log.info("queryDocs: using secondary index '{s}' strategy={s} field={s} store={s}", .{ index_ns, strategy_name, target_field, store_ns });
+
                 // Get candidate primary keys using the appropriate index method
                 self.db_mutex.lock();
                 var primary_keys = switch (strat) {
                     .eq => |pred| self.db.findBySecondaryIndex(index_ns, pred.value) catch |err| {
                         self.db_mutex.unlock();
-                        log.warn("Index eq lookup failed: {}, falling back to full scan", .{err});
+                        log.warn("queryDocs: index eq lookup failed: {}, falling back to full scan", .{err});
                         try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
                         return results.toOwnedSlice(self.allocator);
                     },
                     .range => |r| self.db.findBySecondaryIndexRange(index_ns, r.min_val, r.max_val, r.min_inclusive, r.max_inclusive) catch |err| {
                         self.db_mutex.unlock();
-                        log.warn("Index range scan failed: {}, falling back to full scan", .{err});
+                        log.warn("queryDocs: index range scan failed: {}, falling back to full scan", .{err});
                         try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
                         return results.toOwnedSlice(self.allocator);
                     },
                     .in_list => |il| self.db.findBySecondaryIndexMulti(index_ns, il.values) catch |err| {
                         self.db_mutex.unlock();
-                        log.warn("Index multi-lookup failed: {}, falling back to full scan", .{err});
+                        log.warn("queryDocs: index multi-lookup failed: {}, falling back to full scan", .{err});
                         try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
                         return results.toOwnedSlice(self.allocator);
                     },
                 };
                 defer primary_keys.deinit(self.allocator);
+                log.info("queryDocs: index returned {d} candidate keys", .{primary_keys.items.len});
 
                 var skipped: u32 = 0;
                 var count: u32 = 0;
@@ -825,12 +833,14 @@ pub const Engine = struct {
                     count += 1;
                 }
                 self.db_mutex.unlock();
+                log.info("queryDocs: index scan returned {d} results after predicate filtering", .{results.items.len});
                 used_index = true;
             }
         }
 
         if (!used_index) {
             // No index available or no indexable predicates - full scan
+            log.info("queryDocs: no secondary index available for store={s}, using full scan", .{store_ns});
             try self.fullScanWithFilter(&results, store_id, &parsed, collect_limit, collect_offset);
         }
 
@@ -1328,6 +1338,11 @@ pub const Engine = struct {
                 .range => |r| r.field_name,
                 .in_list => |il| il.field_name,
             };
+            const strategy_name: []const u8 = switch (strat) {
+                .eq => "eq",
+                .range => "range",
+                .in_list => "in",
+            };
 
             self.catalog_mutex.lock();
             var indexes = self.catalog.getIndexesForStore(store_ns, self.allocator) catch {
@@ -1345,7 +1360,12 @@ pub const Engine = struct {
                 }
             }
 
-            const index_ns = found_index orelse break :idx_blk;
+            const index_ns = found_index orelse {
+                log.info("aggregateDocs: no index found for field={s} store={s}, using full scan", .{ target_field, store_ns });
+                break :idx_blk;
+            };
+
+            log.info("aggregateDocs: using secondary index '{s}' strategy={s} field={s} store={s}", .{ index_ns, strategy_name, target_field, store_ns });
 
             // First: process unflushed memtable data (still need full memtable scan for freshness)
             {
@@ -1409,11 +1429,13 @@ pub const Engine = struct {
                 self.db_mutex.unlock();
             }
 
+            log.info("aggregateDocs: index-accelerated aggregation complete for store={s}", .{store_ns});
             used_index = true;
         }
 
         if (!used_index) {
             // Full scan: memtable + primary index (original path)
+            log.info("aggregateDocs: no secondary index available for store={s}, using full scan", .{store_ns});
             {
                 self.db_mutex.lock();
                 defer self.db_mutex.unlock();
